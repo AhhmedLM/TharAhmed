@@ -25,13 +25,16 @@ export type PacketType =
   | 'C2S_TOGGLE_GATE'
   | 'C2S_DIPLOMACY_ACTION'
   | 'C2S_CLAIM_ROLE'
+  | 'C2S_CREATE_CHARACTER'
+  | 'C2S_FOUND_EXILE_KEEP'
   | 'C2S_RESET_WORLD'
   | 'S2C_WELCOME'
   | 'S2C_PONG'
   | 'S2C_STATE_DELTA'
   | 'S2C_WORLD_SNAPSHOT'
   | 'S2C_PACKET_ACK'
-  | 'S2C_MATCH_EVENT';
+  | 'S2C_MATCH_EVENT'
+  | 'S2C_CHARACTER_DEATH';
 
 export type CultureKind =
   | 'iraqi_mesopotamian'
@@ -224,6 +227,179 @@ export type AiFactionKind = 'sindhi_state' | 'crusaders' | 'local_emirate' | 'ba
 export type DiplomacyRelation = 'war' | 'neutral' | 'ally';
 export type PvpMode = 'diplomacy' | 'free_for_all' | 'coop';
 export type SultanHassanMode = 'ai_ruler' | 'human_claimable' | 'disabled';
+export type CommanderRank = 1 | 2 | 3 | 4;
+export type CharacterStatus = 'active' | 'exile_fleeing' | 'dead';
+
+export interface SeasonState {
+  seasonNumber: number;
+  seasonNameAr: string;
+  startedAtMs: number;
+}
+
+export interface CommanderRankSpec {
+  rank: CommanderRank;
+  titleAr: string;
+  badgeColor: string;
+  heroHpBonus: number;
+  unlockedStructures: StructureKind[];
+  economyGoalAr: string;
+  fieldGoalAr: string;
+}
+
+export const COMMANDER_RANK_SPECS: Record<CommanderRank, CommanderRankSpec> = {
+  1: {
+    rank: 1,
+    titleAr: 'قائد ناشئ',
+    badgeColor: '#cbd5e1',
+    heroHpBonus: 0,
+    unlockedStructures: ['house', 'farm', 'lumber_camp', 'quarry', 'barracks'],
+    economyGoalAr: 'ابنِ بيتاً ومزرعة (أو 3 مبانٍ)',
+    fieldGoalAr: 'سيطر على مصدر موارد واحد أو اهزم خصماً',
+  },
+  2: {
+    rank: 2,
+    titleAr: 'أمير ثغر',
+    badgeColor: '#38bdf8',
+    heroHpBonus: 120,
+    unlockedStructures: [
+      'bedouin_tent',
+      'livestock_ranch',
+      'horse_stable',
+      'market',
+      'watchtower',
+      'stone_wall',
+      'war_tent',
+    ],
+    economyGoalAr: 'شيّد 6 مبانٍ وبلوغ تحضر Lv.2',
+    fieldGoalAr: 'سيطر على مصدري موارد أو 5 قتلى أو مدينة',
+  },
+  3: {
+    rank: 3,
+    titleAr: 'والي إقليم',
+    badgeColor: '#c084fc',
+    heroHpBonus: 280,
+    unlockedStructures: ['gatehouse', 'moat_trench', 'siege_workshop', 'temple', 'keep'],
+    economyGoalAr: 'بلوغ مستوى تحضر Lv.3',
+    fieldGoalAr: 'سيطر على 4 مصادر موارد أو مدينتين أو 15 قتيلاً',
+  },
+  4: {
+    rank: 4,
+    titleAr: 'سلطان',
+    badgeColor: '#fbbf24',
+    heroHpBonus: 500,
+    unlockedStructures: [],
+    economyGoalAr: 'أعلى رتبة إدارية وعمرانية في الموسم',
+    fieldGoalAr: 'توسّع بسيطرتك على مرقاب والقدس ومصادر الإقليم',
+  },
+};
+
+export const STRUCTURE_REQUIRED_RANK: Record<StructureKind, CommanderRank> = {
+  house: 1,
+  farm: 1,
+  lumber_camp: 1,
+  quarry: 1,
+  barracks: 1,
+  bedouin_tent: 2,
+  livestock_ranch: 2,
+  horse_stable: 2,
+  market: 2,
+  watchtower: 2,
+  stone_wall: 2,
+  war_tent: 2,
+  gatehouse: 3,
+  moat_trench: 3,
+  siege_workshop: 3,
+  temple: 3,
+  keep: 3,
+};
+
+export function getRequiredRankForStructure(kind: StructureKind): CommanderRank {
+  return STRUCTURE_REQUIRED_RANK[kind] ?? 1;
+}
+
+export interface CommanderRankReport {
+  rank: CommanderRank;
+  spec: CommanderRankSpec;
+  nextSpec: CommanderRankSpec | null;
+  economyDone: boolean;
+  economyProgressAr: string;
+  fieldDone: boolean;
+  fieldProgressAr: string;
+  capturedNodesCount: number;
+  capturedCitiesCount: number;
+}
+
+export function evaluateCommanderRank(
+  structures: BlockoutStructure[],
+  urbanTier: UrbanizationTier,
+  capturedNodesCount: number,
+  capturedCitiesCount: number,
+  kills: number,
+  isSultanHassan?: boolean
+): CommanderRankReport {
+  const nonKeepCount = structures.filter((s) => s.kind !== 'keep' && s.hp > 0).length;
+  const hasHouse = structures.some((s) => (s.kind === 'house' || s.kind === 'bedouin_tent') && s.hp > 0);
+  const hasFarm = structures.some((s) => s.kind === 'farm' && s.hp > 0);
+
+  const r2Eco = (hasHouse && hasFarm) || nonKeepCount >= 3;
+  const r2Field = capturedNodesCount >= 1 || kills >= 1 || capturedCitiesCount >= 1;
+
+  const r3Eco = nonKeepCount >= 6 && urbanTier >= 2;
+  const r3Field = capturedNodesCount >= 2 || kills >= 5 || capturedCitiesCount >= 1;
+
+  const r4Eco = urbanTier >= 3;
+  const r4Field = capturedNodesCount >= 4 || kills >= 15 || capturedCitiesCount >= 2;
+
+  let rank: CommanderRank = 1;
+  if (isSultanHassan) {
+    rank = 4;
+  } else if (r2Eco && r2Field) {
+    rank = 2;
+    if (r3Eco && r3Field) {
+      rank = 3;
+      if (r4Eco && r4Field) {
+        rank = 4;
+      }
+    }
+  }
+
+  const spec = COMMANDER_RANK_SPECS[rank];
+  const nextSpec = rank < 4 ? COMMANDER_RANK_SPECS[(rank + 1) as CommanderRank] : null;
+
+  let economyDone = true;
+  let economyProgressAr = spec.economyGoalAr;
+  let fieldDone = true;
+  let fieldProgressAr = spec.fieldGoalAr;
+
+  if (rank === 1) {
+    economyDone = r2Eco;
+    economyProgressAr = `المباني: ${hasHouse ? '✓بيت' : 'بيت'} · ${hasFarm ? '✓مزرعة' : 'مزرعة'} (أو ${nonKeepCount}/3 مبانٍ)`;
+    fieldDone = r2Field;
+    fieldProgressAr = `السيطرة الميدانية: ${capturedNodesCount}/1 مصدر موارد أو ${kills}/1 خصم`;
+  } else if (rank === 2) {
+    economyDone = r3Eco;
+    economyProgressAr = `المباني: ${nonKeepCount}/6 · التحضر Lv.${urbanTier}/2`;
+    fieldDone = r3Field;
+    fieldProgressAr = `النفوذ: ${capturedNodesCount}/2 مصادر أو ${kills}/5 قتلى أو ${capturedCitiesCount}/1 مدينة`;
+  } else if (rank === 3) {
+    economyDone = r4Eco;
+    economyProgressAr = `مستوى التحضر: Lv.${urbanTier}/3`;
+    fieldDone = r4Field;
+    fieldProgressAr = `النفوذ: ${capturedNodesCount}/4 مصادر أو ${capturedCitiesCount}/2 مدن أو ${kills}/15 قتيلاً`;
+  }
+
+  return {
+    rank,
+    spec,
+    nextSpec,
+    economyDone,
+    economyProgressAr,
+    fieldDone,
+    fieldProgressAr,
+    capturedNodesCount,
+    capturedCitiesCount,
+  };
+}
 
 export interface TrainingQueueItem {
   id: string;
@@ -286,6 +462,14 @@ export interface PlayerState {
   structuresRazed?: number;
   capturedCapitals?: number;
   trainingQueue?: TrainingQueueItem[];
+  heroUnitId?: string | null;
+  characterCreated?: boolean;
+  characterStatus?: CharacterStatus;
+  commanderRank?: CommanderRank;
+  capturedNodesCount?: number;
+  capturedCitiesCount?: number;
+  fallenAtMs?: number;
+  killedByNameAr?: string;
 }
 
 export interface BlockoutStructure {
@@ -312,6 +496,8 @@ export interface BlockoutStructure {
   isWaterMoat?: boolean;
   burnUntilTick?: number;
   burnAttackerId?: string;
+  captureProgress?: number;
+  capturingOwnerId?: string | null;
 }
 
 export type CitizenRoleKind =
@@ -378,6 +564,7 @@ export interface BlockoutUnit {
   lastChargeTick?: number;
   movedMetersSinceCharge?: number;
   isHeroSultan?: boolean;
+  isPlayerHero?: boolean;
   displayNameAr?: string;
 }
 
@@ -388,6 +575,11 @@ export interface ResourceNode {
   z: number;
   amount: number;
   maxAmount: number;
+  ownerId?: string | null;
+  ownerColor?: string;
+  ownerNameAr?: string;
+  captureProgress?: number;
+  capturingOwnerId?: string | null;
 }
 
 export interface CombatEvent {
@@ -444,6 +636,7 @@ export interface WorldState {
   sultanHassanMode?: SultanHassanMode;
   sultanHassanOwnerId?: string | null;
   matchStatus?: MatchStatusState;
+  season?: SeasonState;
 }
 
 export interface NetworkPacket<T = unknown> {

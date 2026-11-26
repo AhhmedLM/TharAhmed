@@ -27,6 +27,7 @@ import {
   Magnet,
   Map as MapIcon,
   Maximize,
+  Menu,
   Minimize,
   MousePointer,
   Pause,
@@ -59,13 +60,16 @@ import {
   BANDIT_CLAN_OUTFIT_AR,
   BANDIT_STATE_LABELS_AR,
   BannerPatternKind,
+  COMMANDER_RANK_SPECS,
   CULTURE_SPECS,
   CultureKind,
+  evaluateCommanderRank,
   evaluateEnvironmentalFit,
   evaluateKingdomCapacity,
   evaluateKingdomUrbanization,
   evaluatePopulationLife,
   getRecommendedCultureForBiome,
+  getRequiredRankForStructure,
   getStructureDefenseSpec,
   getStructureUpgradeRequirement,
   getTotalCarriedLoot,
@@ -124,6 +128,8 @@ import {
   SoldierTrainingCampPanel,
 } from './SoldierTrainingCampPanel';
 import { AdminDirectorModal } from './AdminDirectorModal';
+import { CharacterEntryModal } from './CharacterEntryModal';
+import { RankProgressionWidget } from './RankProgressionWidget';
 import {
   BrassCornerMountSvg,
   ChiseledSeparatorSvg,
@@ -531,6 +537,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     lastAckMessage,
     matchEvent,
     clearMatchEvent,
+    characterDeathEvent,
     syncCamera,
     placeStructure,
     placeFortBatch,
@@ -550,6 +557,8 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     tradeResource,
     sendDiplomacyAction,
     claimRole,
+    createCharacter,
+    foundExileKeep,
     resetWorld,
     setClimate,
     hydrateFromCloud,
@@ -611,6 +620,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     useState<CameraProjectionMode>('isometric_2000s');
   const [activePopup, setActivePopup] = useState<PopupModalKind>(null);
   const [adminModalOpen, setAdminModalOpen] = useState<boolean>(false);
+  const [topMenuOpen, setTopMenuOpen] = useState<boolean>(false);
   const [hoveredEntity, setHoveredEntity] = useState<HoveredEntityInfo | null>(null);
   const [buildCategory, setBuildCategory] = useState<BuildCategoryTab>('all');
   const [requestedTrainingUnitKind, setRequestedTrainingUnitKind] =
@@ -873,6 +883,18 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     () => myUnits.filter((u) => u.kind !== 'worker'),
     [myUnits]
   );
+  const myHeroUnit = useMemo(
+    () =>
+      (myPlayer?.heroUnitId && worldState?.units?.[myPlayer.heroUnitId]) ||
+      myUnits.find((u) => u.isPlayerHero) ||
+      null,
+    [myPlayer?.heroUnitId, worldState?.units, myUnits]
+  );
+  const sultanHassanClaimable = useMemo(() => {
+    const mode = worldState?.directorConfig?.sultanHassanMode;
+    if (mode !== 'human_claimable') return false;
+    return !playersList.some((p) => !p.isAi && p.isSultanHassan && p.id !== playerId);
+  }, [worldState?.directorConfig?.sultanHassanMode, playersList, playerId]);
 
   const trainingQueue = useMemo(() => myPlayer?.trainingQueue ?? [], [myPlayer?.trainingQueue]);
 
@@ -1726,6 +1748,58 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     );
   }, [worldState?.resourceNodes, resourceFilter, myStructures]);
 
+  const rankReport = useMemo(
+    () =>
+      evaluateCommanderRank(
+        myStructures,
+        economyStats.urbanReport.tier,
+        myPlayer?.capturedNodesCount ?? 0,
+        myPlayer?.capturedCitiesCount ?? 0,
+        myPlayer?.kills ?? 0,
+        myPlayer?.isSultanHassan
+      ),
+    [
+      myStructures,
+      economyStats.urbanReport.tier,
+      myPlayer?.capturedNodesCount,
+      myPlayer?.capturedCitiesCount,
+      myPlayer?.kills,
+      myPlayer?.isSultanHassan,
+    ]
+  );
+
+  const handleFocusHero = useCallback(() => {
+    if (!myHeroUnit) return;
+    setSelectedUnitIds([myHeroUnit.id]);
+    triggerCameraPreset({ targetX: myHeroUnit.x, targetZ: myHeroUnit.z, zoom: 24 });
+    soundFx.playSelect();
+  }, [myHeroUnit, triggerCameraPreset]);
+
+  const handleJumpNearestNeutralNode = useCallback(() => {
+    const nodes = Object.values(worldState?.resourceNodes ?? {}).filter(
+      (n) => n.amount > 0 && n.ownerId !== playerId
+    );
+    if (nodes.length === 0) return;
+    const refX = myHeroUnit?.x ?? myKeep?.x ?? 0;
+    const refZ = myHeroUnit?.z ?? myKeep?.z ?? 0;
+    nodes.sort(
+      (a, b) => Math.hypot(a.x - refX, a.z - refZ) - Math.hypot(b.x - refX, b.z - refZ)
+    );
+    const target = nodes[0];
+    triggerCameraPreset({ targetX: target.x, targetZ: target.z, zoom: 26 });
+    const squad =
+      militaryUnits.length > 0
+        ? militaryUnits.map((u) => u.id)
+        : myHeroUnit
+          ? [myHeroUnit.id]
+          : [];
+    if (squad.length > 0) {
+      setSelectedUnitIds(squad);
+      handleMoveUnits(squad, target.x, target.z);
+    }
+    soundFx.playMoveOrder();
+  }, [worldState?.resourceNodes, playerId, myHeroUnit, myKeep, militaryUnits, triggerCameraPreset, handleMoveUnits]);
+
   const isTrainingDeckActive = Boolean(
     !buildMode &&
       selectedStructure &&
@@ -1835,6 +1909,22 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
           )}
         </div>
       )}
+
+      {/* Compact Rank & Hero Progression Guide (Top-Right, Collapsible) */}
+      {!strategicMap.open &&
+        myPlayer &&
+        myPlayer.characterCreated &&
+        myPlayer.characterStatus !== 'dead' && (
+          <RankProgressionWidget
+            season={worldState?.season}
+            rankReport={rankReport}
+            characterStatus={myPlayer.characterStatus ?? 'active'}
+            heroUnit={myHeroUnit}
+            onFocusHero={handleFocusHero}
+            onJumpNearestNeutralNode={handleJumpNearestNeutralNode}
+            onFoundExileKeep={foundExileKeep}
+          />
+        )}
 
       {/* Full-Viewport Unlimited-Resolution WebGL2 Procedural Strategic Map (Persistently mounted so WebGL2 shader stays warm across scroll-zoom transitions) */}
       <section
@@ -2254,46 +2344,6 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
             <span className="hidden lg:inline whitespace-nowrap">الخريطة</span>
           </button>
 
-          {/* Cloud Sync Ledger */}
-          <button
-            type="button"
-            onClick={() => togglePopup('cloud')}
-            title={user ? 'الحفظ السحابي متصل' : 'الحفظ السحابي والمزامنة'}
-            className={`h-6 sm:h-7 px-1.5 flex items-center gap-1 text-[10px] font-bold shrink-0 cursor-pointer ${
-              activePopup === 'cloud'
-                ? 'rts2k-bevel-btn-gold'
-                : 'rts2k-bevel-btn text-[#d6c3a5]'
-            }`}
-          >
-            <span
-              className={`w-1.5 h-3 shrink-0 border border-black/70 ${
-                user ? 'bg-[#a3b87c]' : 'bg-[#c8902e]'
-              }`}
-            />
-            <Cloud className="w-3.5 h-3.5 shrink-0" />
-            <span className="hidden xl:inline whitespace-nowrap">السحابة</span>
-          </button>
-
-          {/* Heraldry & Settings Ledger */}
-          <button
-            type="button"
-            onClick={() => togglePopup('settings')}
-            title="راية المملكة وإعدادات البكسل والشبكة"
-            className={`h-6 sm:h-7 px-1.5 flex items-center gap-1 text-[10px] font-bold shrink-0 cursor-pointer ${
-              activePopup === 'settings'
-                ? 'rts2k-bevel-btn-gold'
-                : 'rts2k-bevel-btn text-[#d6c3a5]'
-            }`}
-          >
-            <span
-              className={`w-1.5 h-3 shrink-0 border border-black/70 ${
-                connected ? 'bg-[#a3b87c]' : 'bg-[#872b24]'
-              }`}
-            />
-            <Sliders className="w-3.5 h-3.5 shrink-0" />
-            <span className="hidden xl:inline whitespace-nowrap">الراية</span>
-          </button>
-
           {/* Co-op PvE Fronts & Governed Cities Modal Toggle */}
           <button
             type="button"
@@ -2310,46 +2360,87 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
             <span className="hidden lg:inline whitespace-nowrap">الجبهات</span>
           </button>
 
-          {/* World Director & Sultan Hassan Dashboard */}
-          <button
-            type="button"
-            onClick={() => setAdminModalOpen(true)}
-            title="لوحة مخرج العالم: السلطان حسن، المدن، وقواعد القتال"
-            className={`h-6 sm:h-7 px-1.5 sm:px-2 flex items-center gap-1 text-[10px] font-bold shrink-0 cursor-pointer ${
-              adminModalOpen ? 'rts2k-bevel-btn-gold' : 'rts2k-bevel-btn text-[#fde68a]'
-            }`}
-          >
-            <Crown className="w-3.5 h-3.5 text-[#fbbf24] shrink-0" />
-            <span className="hidden xl:inline whitespace-nowrap">المخرج</span>
-          </button>
+          {/* Compact Grouped Menu Dropdown (Reduces Top-Bar Clutter on Mobile & Desktop) */}
+          <div className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setTopMenuOpen((prev) => !prev)}
+              title="القائمة: المخرج، الراية، السحابة، الصوت وملء الشاشة"
+              className={`h-6 sm:h-7 px-1.5 sm:px-2 flex items-center gap-1 text-[10px] font-bold cursor-pointer ${
+                topMenuOpen ? 'rts2k-bevel-btn-gold' : 'rts2k-bevel-btn text-[#ffebb0]'
+              }`}
+            >
+              <Menu className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden sm:inline whitespace-nowrap">القائمة</span>
+            </button>
 
-          {/* Web Audio SFX Mute Toggle */}
-          <button
-            type="button"
-            onClick={handleToggleSfx}
-            title={sfxMuted ? 'تفعيل المؤثرات الصوتية' : 'كتم المؤثرات الصوتية'}
-            className="h-6 sm:h-7 px-1.5 rts2k-bevel-btn text-[#ffebb0] flex items-center justify-center shrink-0 cursor-pointer"
-          >
-            {sfxMuted ? (
-              <VolumeX className="w-3.5 h-3.5 text-[#f87171]" />
-            ) : (
-              <Volume2 className="w-3.5 h-3.5 text-[#a3e635]" />
+            {topMenuOpen && (
+              <div className="absolute left-0 top-8 z-40 w-44 rts2k-stone-frame p-1.5 space-y-1 shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTopMenuOpen(false);
+                    setAdminModalOpen(true);
+                  }}
+                  className="w-full h-7 px-2 rts2k-bevel-btn text-[10.5px] font-bold text-[#fde68a] flex items-center gap-2 cursor-pointer"
+                >
+                  <Crown className="w-3.5 h-3.5 text-[#fbbf24] shrink-0" />
+                  <span>لوحة المخرج والمواسم</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTopMenuOpen(false);
+                    togglePopup('settings');
+                  }}
+                  className="w-full h-7 px-2 rts2k-bevel-btn text-[10.5px] font-bold text-[#f3e5c8] flex items-center gap-2 cursor-pointer"
+                >
+                  <Sliders className="w-3.5 h-3.5 shrink-0" />
+                  <span>الراية والإعدادات</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTopMenuOpen(false);
+                    togglePopup('cloud');
+                  }}
+                  className="w-full h-7 px-2 rts2k-bevel-btn text-[10.5px] font-bold text-[#f3e5c8] flex items-center gap-2 cursor-pointer"
+                >
+                  <Cloud className="w-3.5 h-3.5 shrink-0" />
+                  <span>{user ? 'السحابة (متصل)' : 'الحفظ السحابي'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleToggleSfx();
+                  }}
+                  className="w-full h-7 px-2 rts2k-bevel-btn text-[10.5px] font-bold text-[#f3e5c8] flex items-center gap-2 cursor-pointer"
+                >
+                  {sfxMuted ? (
+                    <VolumeX className="w-3.5 h-3.5 text-[#f87171] shrink-0" />
+                  ) : (
+                    <Volume2 className="w-3.5 h-3.5 text-[#a3e635] shrink-0" />
+                  )}
+                  <span>{sfxMuted ? 'تفعيل الصوت' : 'كتم الصوت'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTopMenuOpen(false);
+                    toggleFullscreen();
+                  }}
+                  className="w-full h-7 px-2 rts2k-bevel-btn text-[10.5px] font-bold text-[#f3e5c8] flex items-center gap-2 cursor-pointer"
+                >
+                  {isFullscreen ? (
+                    <Minimize className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <Maximize className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                  <span>{isFullscreen ? 'إنهاء ملء الشاشة' : 'ملء الشاشة (F)'}</span>
+                </button>
+              </div>
             )}
-          </button>
-
-          {/* Fullscreen Toggle */}
-          <button
-            type="button"
-            onClick={toggleFullscreen}
-            title="وضع ملء الشاشة (مفتاح F)"
-            className="h-6 sm:h-7 px-1.5 rts2k-bevel-btn text-[#ffebb0] flex items-center justify-center shrink-0 cursor-pointer"
-          >
-            {isFullscreen ? (
-              <Minimize className="w-3.5 h-3.5" />
-            ) : (
-              <Maximize className="w-3.5 h-3.5" />
-            )}
-          </button>
+          </div>
         </nav>
       </header>
 
@@ -3207,8 +3298,11 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                   (myPlayer?.resources.food ?? 0) >= foodCost &&
                   (myPlayer?.resources.cloth ?? 0) >= clothCost &&
                   (myPlayer?.resources.horses ?? 0) >= horsesCost;
+                const requiredRank = getRequiredRankForStructure(kind);
+                const rankUnlocked =
+                  Boolean(myPlayer?.isSultanHassan) || rankReport.rank >= requiredRank;
                 const urbanUnlocked =
-                  economyStats.urbanReport.tier >= spec.requiredUrbanTier;
+                  rankUnlocked && economyStats.urbanReport.tier >= spec.requiredUrbanTier;
 
                 const shortNameAr = spec.labelAr.split(' (')[0];
                 const isInspected = inspectedBuildKind === kind;
@@ -3239,17 +3333,25 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                         setBuildMode(kind);
                       }
                     }}
-                    title={`${shortNameAr} — نقرة لعرض التكلفة، نقرتان للتشييد`}
+                    title={
+                      !rankUnlocked
+                        ? `${shortNameAr} — يُفتح عند رتبة ${COMMANDER_RANK_SPECS[requiredRank].titleAr}`
+                        : `${shortNameAr} — نقرة لعرض التكلفة، نقرتان للتشييد`
+                    }
                     className={`rts2k-hud-tile group relative w-[62px] h-[52px] sm:w-[76px] sm:h-[96px] lg:h-[100px] p-0.5 sm:p-1 flex flex-col items-center justify-between shrink-0 cursor-pointer select-none ${
                       isSelectedBuild
                         ? 'rts2k-bevel-btn-emerald'
                         : isInspected
                           ? 'rts2k-bevel-btn-gold'
                           : 'rts2k-bevel-btn'
-                    } ${!canAfford || !urbanUnlocked ? 'opacity-55' : ''}`}
+                    } ${!canAfford || !urbanUnlocked ? 'opacity-50' : ''}`}
                   >
-                    {/* Top Corner Subtle Badge: Lock Tier or Owned Count */}
-                    {!urbanUnlocked ? (
+                    {/* Top Corner Subtle Badge: Lock Rank/Tier or Owned Count */}
+                    {!rankUnlocked ? (
+                      <span className="absolute top-0.5 right-0.5 text-[7px] sm:text-[8px] font-bold text-[#fbbf24]">
+                        رتبة {requiredRank}
+                      </span>
+                    ) : !urbanUnlocked ? (
                       <span className="absolute top-0.5 right-0.5 text-[7px] sm:text-[8px] font-mono font-bold text-[#d47a70]">
                         Lv.{spec.requiredUrbanTier}
                       </span>
@@ -3993,8 +4095,11 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                   const hasCloth = (myPlayer?.resources.cloth ?? 0) >= clothCost;
                   const hasHorses = (myPlayer?.resources.horses ?? 0) >= horsesCost;
                   const canAfford = hasWood && hasStone && hasGold && hasFood && hasCloth && hasHorses;
+                  const requiredRank = getRequiredRankForStructure(targetKind);
+                  const rankUnlocked =
+                    Boolean(myPlayer?.isSultanHassan) || rankReport.rank >= requiredRank;
                   const urbanUnlocked =
-                    economyStats.urbanReport.tier >= spec.requiredUrbanTier;
+                    rankUnlocked && economyStats.urbanReport.tier >= spec.requiredUrbanTier;
 
                   const roleTextAr =
                     targetKind === 'house'
@@ -4142,11 +4247,13 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                         >
                           <Hammer className="w-3.5 h-3.5 shrink-0" />
                           <span>
-                            {!urbanUnlocked
-                              ? `يتطلب تحضر Lv.${spec.requiredUrbanTier}`
-                              : !canAfford
-                                ? 'موارد غير كافية'
-                                : 'تشييد المبنى'}
+                            {!rankUnlocked
+                              ? `يتطلب رتبة «${COMMANDER_RANK_SPECS[requiredRank].titleAr}»`
+                              : !urbanUnlocked
+                                ? `يتطلب تحضر Lv.${spec.requiredUrbanTier}`
+                                : !canAfford
+                                  ? 'موارد غير كافية'
+                                  : 'تشييد المبنى'}
                           </span>
                         </button>
                       </div>
@@ -4245,6 +4352,48 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
       {adminModalOpen && (
         <AdminDirectorModal onClose={() => setAdminModalOpen(false)} />
       )}
+
+      {/* =====================================================================
+          3B-2. CHARACTER ENTRY & PERMADEATH REBIRTH MODAL
+         ===================================================================== */}
+      {connected &&
+        myPlayer &&
+        (!myPlayer.characterCreated ||
+          myPlayer.characterStatus === 'dead' ||
+          Boolean(characterDeathEvent)) && (
+          <CharacterEntryModal
+            season={worldState?.season}
+            defaultName={customKingdomName || myPlayer.name || 'أمير ثار أحمد'}
+            defaultPrimaryColor={customPrimaryColor || myPlayer.color || '#0d9488'}
+            defaultSecondaryColor={customSecondaryColor || myPlayer.secondaryColor || '#fbbf24'}
+            defaultBannerPattern={customBannerPattern || myPlayer.bannerPattern || 'crescent_star'}
+            defaultCulture={activeCulture}
+            sultanHassanClaimable={sultanHassanClaimable}
+            isPermadeathRebirth={
+              myPlayer.characterStatus === 'dead' || Boolean(characterDeathEvent)
+            }
+            fallenInfo={
+              characterDeathEvent ??
+              (myPlayer.characterStatus === 'dead'
+                ? {
+                    fallenNameAr: myPlayer.name,
+                    killerNameAr: myPlayer.killedByNameAr ?? 'معركة ميدانية',
+                    reasonAr:
+                      'سقط قائدك في المعركة! في نظام المواسم الموت دائم — أنشئ شخصية جديدة لمواصلة اللعب.',
+                  }
+                : null)
+            }
+            onConfirm={(payload) => {
+              setCustomKingdomName(payload.name);
+              setCustomPrimaryColor(payload.primaryColor);
+              setCustomSecondaryColor(payload.secondaryColor);
+              setCustomBannerPattern(payload.bannerPattern);
+              setSelectedCulture(payload.culture);
+              createCharacter(payload);
+              soundFx.playVictoryFanfare();
+            }}
+          />
+        )}
 
       {/* =====================================================================
           3C. VICTORY / DEFEAT MATCH OUTCOME MODAL

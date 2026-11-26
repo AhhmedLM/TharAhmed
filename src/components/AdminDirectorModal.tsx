@@ -106,7 +106,7 @@ export const AdminDirectorModal: React.FC<AdminDirectorModalProps> = ({ onClose 
   };
 
   const runPlayerAction = async (
-    action: 'assign_sultan' | 'revoke_sultan' | 'kick' | 'reset_world',
+    action: 'assign_sultan' | 'revoke_sultan' | 'kick' | 'reset_world' | 'new_season',
     targetPlayerId?: string
   ) => {
     setErrorMsg(null);
@@ -446,14 +446,24 @@ export const AdminDirectorModal: React.FC<AdminDirectorModalProps> = ({ onClose 
                   إعادة بناء العالم من جديد بآخر إعدادات المدير أعلاه:
                 </span>
                 {!confirmReset ? (
-                  <button
-                    type="button"
-                    onClick={() => setConfirmReset(true)}
-                    className="px-3 py-1.5 bg-rose-900 hover:bg-rose-800 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                    <span>إعادة تهيئة العالم</span>
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void runPlayerAction('new_season')}
+                      className="px-3 py-1.5 bg-amber-800 hover:bg-amber-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Crown className="w-3.5 h-3.5" />
+                      <span>بدء موسم جديد</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmReset(true)}
+                      className="px-3 py-1.5 bg-rose-900 hover:bg-rose-800 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      <span>إعادة تهيئة العالم</span>
+                    </button>
+                  </div>
                 ) : (
                   <div className="flex items-center gap-2">
                     <button

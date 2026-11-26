@@ -1,0 +1,27 @@
+{
+  "pvpMode": "free_for_all",
+  "sultanHassanMode": "human_claimable",
+  "sultanHassanAssignedUid": "plr_236c5618",
+  "enabledCities": {
+    "ai_sindhi_mirqab": true,
+    "ai_sindhi_rusafa": true,
+    "ai_sindhi_nusaybin": true,
+    "ai_sindhi_damascus": true,
+    "ai_sindhi_aleppo": true,
+    "ai_sindhi_mosul": true,
+    "ai_sindhi_raqqa": true,
+    "ai_sindhi_tikrit": true,
+    "ai_sindhi_kufa": true,
+    "ai_sindhi_black_valley": true,
+    "ai_sindhi_hejaz": true,
+    "ai_crusader_jerusalem": true,
+    "ai_crusader_antioch": true,
+    "ai_crusader_acre": true,
+    "ai_emirate_homs": true,
+    "ai_emirate_tadmur": true
+  },
+  "banditsEnabled": true,
+  "banditDifficulty": "balanced",
+  "banditCampCount": 3,
+  "dominionVictoryTargetCities": 6
+}

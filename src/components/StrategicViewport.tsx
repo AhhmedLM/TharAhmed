@@ -1551,10 +1551,14 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
                   hovered = {
                     entityKind: 'unit',
                     id: u.id,
-                    titleAr: u.isHeroSultan ? `السلطان حسن (${uSpec?.shortAr ?? u.kind})` : (uSpec?.shortAr ?? u.kind),
-                    subtitleAr: `${ownerName} · صحة ${Math.round(u.hp)}/${u.maxHp}`,
+                    titleAr: u.isHeroSultan
+                      ? `السلطان حسن (${uSpec?.shortAr ?? u.kind})`
+                      : u.isPlayerHero
+                        ? `القائد ${u.displayNameAr || ownerName}`
+                        : (uSpec?.shortAr ?? u.kind),
+                    subtitleAr: `${ownerName} · صحة ${Math.round(u.hp)}/${u.maxHp}${u.isPlayerHero ? ' · شخصية اللاعب' : ''}`,
                     hpPct: u.maxHp > 0 ? Math.max(0, Math.min(100, Math.round((u.hp / u.maxHp) * 100))) : 100,
-                    accentColor: u.ownerColor,
+                    accentColor: u.isPlayerHero ? '#fbbf24' : u.ownerColor,
                   };
                 }
               }
@@ -1573,11 +1577,15 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
                     bestDist = d;
                     const sSpec = STRUCTURE_SPECS[st.kind];
                     const ownerName = ownerPlr?.name ?? 'بناء مستقل';
+                    const capSuffix =
+                      st.captureProgress && st.captureProgress > 0 && st.captureProgress < 100
+                        ? ` · رفع راية ${Math.round(st.captureProgress)}%`
+                        : '';
                     hovered = {
                       entityKind: 'structure',
                       id: st.id,
                       titleAr: `${sSpec?.labelAr?.split(' (')[0] ?? st.kind} (م${st.level ?? 1})`,
-                      subtitleAr: `${ownerName} · متانة ${Math.round(st.hp)}/${st.maxHp}`,
+                      subtitleAr: `${ownerName} · متانة ${Math.round(st.hp)}/${st.maxHp}${capSuffix}`,
                       hpPct: st.maxHp > 0 ? Math.max(0, Math.min(100, Math.round((st.hp / st.maxHp) * 100))) : 100,
                       accentColor: st.ownerColor,
                     };
@@ -1593,12 +1601,18 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
                   const d = Math.hypot(rn.x - hit.x, rn.z - hit.z);
                   if (d < bestDist) {
                     bestDist = d;
+                    const ownerInfo = rn.ownerNameAr
+                      ? `تحت راية: ${rn.ownerNameAr} (+دخل تلقائي)`
+                      : rn.captureProgress && rn.captureProgress > 0
+                        ? `جاري رفع الراية: ${Math.round(rn.captureProgress)}%`
+                        : 'محايد — أرسل جنودك 6ث للسيطرة';
                     hovered = {
                       entityKind: 'resource',
                       id: rn.id,
                       titleAr: RESOURCE_LABELS_AR[rn.kind] ?? rn.kind,
-                      subtitleAr: `متبقي ${Math.round(rn.amount)} / ${rn.maxAmount}`,
+                      subtitleAr: `${ownerInfo} · متبقي ${Math.round(rn.amount)}`,
                       hpPct: rn.maxAmount > 0 ? Math.round((rn.amount / rn.maxAmount) * 100) : 100,
+                      accentColor: rn.ownerColor,
                     };
                   }
                 }

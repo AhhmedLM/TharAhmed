@@ -12,6 +12,7 @@ import {
   PacketType,
   PveDifficulty,
   PveTheaterState,
+  SeasonState,
   StructureKind,
   UnitKind,
   WorldDirectorConfig,
@@ -24,6 +25,12 @@ export interface MatchOutcomeEvent {
   winnerPlayerId?: string;
   winnerNameAr?: string;
   reasonAr?: string;
+}
+
+export interface CharacterDeathEvent {
+  fallenNameAr: string;
+  killerNameAr: string;
+  reasonAr: string;
 }
 
 interface UseMultiplayerOptions {
@@ -42,6 +49,7 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
   const [packetLogs, setPacketLogs] = useState<PacketLogEntry[]>([]);
   const [lastAckMessage, setLastAckMessage] = useState<string>('جاهز للاتصال بالخادم...');
   const [matchEvent, setMatchEvent] = useState<MatchOutcomeEvent | null>(null);
+  const [characterDeathEvent, setCharacterDeathEvent] = useState<CharacterDeathEvent | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const seqRef = useRef<number>(1);
@@ -52,6 +60,10 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
 
   const clearMatchEvent = useCallback(() => {
     setMatchEvent(null);
+  }, []);
+
+  const clearCharacterDeathEvent = useCallback(() => {
+    setCharacterDeathEvent(null);
   }, []);
 
   const appendPacketLog = useCallback(
@@ -277,6 +289,8 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
                 matchStatus:
                   (pkt.payload.matchStatus as MatchStatusState | undefined) ??
                   prevWorld?.matchStatus,
+                season:
+                  (pkt.payload.season as SeasonState | undefined) ?? prevWorld?.season,
               };
               worldRef.current = nextWorld;
               const hasImportantUiChange =
@@ -311,6 +325,17 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
                   typeof pkt.payload.reasonAr === 'string' ? pkt.payload.reasonAr : undefined,
               });
               appendPacketLog('IN', pkt, raw.length, `نتيجة المعركة: ${outcome}`);
+              break;
+            }
+
+            case 'S2C_CHARACTER_DEATH': {
+              const fallenNameAr = String(pkt.payload.fallenNameAr || 'القائد');
+              const killerNameAr = String(pkt.payload.killerNameAr || 'معركة ميدانية');
+              const reasonAr = String(
+                pkt.payload.reasonAr || 'سقط قائدك في المعركة — أنشئ شخصية جديدة لمواصلة الموسم.'
+              );
+              setCharacterDeathEvent({ fallenNameAr, killerNameAr, reasonAr });
+              appendPacketLog('IN', pkt, raw.length, `سقوط الشخصية: ${fallenNameAr}`);
               break;
             }
 
@@ -646,6 +671,25 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
     sendPacket('C2S_RECLAIM_KEEP', {}, 'إعادة تأسيس المعقل والحامية');
   }, [sendPacket]);
 
+  const createCharacter = useCallback(
+    (payload: {
+      name: string;
+      primaryColor: string;
+      secondaryColor: string;
+      bannerPattern: BannerPatternKind;
+      culture: CultureKind;
+      startMode?: 'independent' | 'sultan_hassan';
+    }) => {
+      sendPacket('C2S_CREATE_CHARACTER', payload, `إنشاء شخصية: ${payload.name}`);
+      setCharacterDeathEvent(null);
+    },
+    [sendPacket]
+  );
+
+  const foundExileKeep = useCallback(() => {
+    sendPacket('C2S_FOUND_EXILE_KEEP', {}, 'تأسيس معقل جديد / ثورة عند موقع القائد');
+  }, [sendPacket]);
+
   const toggleGate = useCallback(
     (structureId: string) => {
       sendPacket('C2S_TOGGLE_GATE', { structureId }, `تبديل مزلاج البوابة (${structureId})`);
@@ -664,6 +708,8 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
     lastAckMessage,
     matchEvent,
     clearMatchEvent,
+    characterDeathEvent,
+    clearCharacterDeathEvent,
     syncCamera,
     placeStructure,
     placeFortBatch,
@@ -681,6 +727,8 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
     deployPveFronts,
     sendDiplomacyAction,
     claimRole,
+    createCharacter,
+    foundExileKeep,
     reclaimKeep,
     dispatchAtlasMarch,
     tradeResource,

@@ -22,13 +22,16 @@ import {
 import {
   BANDIT_UNIT_SPECS,
   BANNER_PATTERN_SPECS,
+  COMMANDER_RANK_SPECS,
   CULTURE_SPECS,
+  evaluateCommanderRank,
   evaluateEnvironmentalFit,
   evaluateKingdomCapacity,
   evaluateKingdomUrbanization,
   evaluatePopulationLife,
   getBanditRoleForUnitKind,
   getRecommendedCultureForBiome,
+  getRequiredRankForStructure,
   getStructureDefenseSpec,
   getStructureUpgradeRequirement,
   getTotalCarriedLoot,
@@ -52,7 +55,6 @@ import type {
   CultureKind,
   DiplomacyRelation,
   MarchWaypoint,
-  MatchStatusState,
   NetworkPacket,
   PlayerResources,
   PlayerState,
@@ -362,6 +364,11 @@ const worldState: WorldState = {
   combatEvents: [],
   diplomacy: {},
   matchStatus: { status: 'active' },
+  season: {
+    seasonNumber: 1,
+    seasonNameAr: 'الموسم الأول — قيام الدولة السندية',
+    startedAtMs: Date.now(),
+  },
 };
 
 const MAX_LOADED_SECTORS = 350;
@@ -596,7 +603,7 @@ function spawnPlayerInitialBase(
   player: PlayerState,
   spawnX: number,
   spawnZ: number,
-  variant: 'full_capital' | 'frontier_raider' = 'full_capital',
+  variant: 'full_capital' | 'frontier_raider' | 'starter_settlement' = 'starter_settlement',
   difficulty: PveDifficulty = 'balanced'
 ) {
   const culture: CultureKind = normalizeCultureKind(player.culture);
@@ -610,7 +617,12 @@ function spawnPlayerInitialBase(
     dz: number;
     rot: number;
   }> =
-    variant === 'frontier_raider'
+    variant === 'starter_settlement'
+      ? [
+          { kind: 'keep', level: 1, dx: 0, dz: 0, rot: 0 },
+          { kind: 'house', level: 1, dx: -dirX * 6, dz: -2, rot: 0 },
+        ]
+      : variant === 'frontier_raider'
       ? [
           { kind: 'keep', level: 1, dx: 0, dz: 0, rot: 0 },
           { kind: 'house', level: 1, dx: -dirX * 7, dz: -3, rot: 0 },
@@ -676,8 +688,16 @@ function spawnPlayerInitialBase(
     };
   });
 
-  const initialUnits: Array<{ kind: UnitKind; dx: number; dz: number }> =
-    variant === 'frontier_raider'
+  const initialUnits: Array<{ kind: UnitKind; dx: number; dz: number; isHero?: boolean }> =
+    variant === 'starter_settlement'
+      ? [
+          { kind: 'commander', dx: dirX * 3.5, dz: dirZ * 3.5, isHero: true },
+          { kind: 'worker', dx: dirX * 5, dz: -3 },
+          { kind: 'worker', dx: dirX * 5, dz: 0 },
+          { kind: 'infantry', dx: dirX * 7, dz: dirZ * 6 },
+          { kind: 'infantry', dx: dirX * 9, dz: dirZ * 6 },
+        ]
+      : variant === 'frontier_raider'
       ? difficulty === 'casual'
         ? [
             { kind: 'worker', dx: dirX * 4, dz: -2 },
@@ -715,6 +735,8 @@ function spawnPlayerInitialBase(
     const ux = quantize(spawnX + u.dx);
     const uz = quantize(spawnZ + u.dz);
     const spec = UNIT_SPECS[u.kind];
+    const isHero = Boolean(u.isHero);
+    const unitMaxHp = isHero ? Math.round(spec.maxHp * 1.45) : spec.maxHp;
     worldState.units[unitId] = {
       id: unitId,
       ownerId: player.id,
@@ -727,15 +749,23 @@ function spawnPlayerInitialBase(
       targetX: ux,
       targetZ: uz,
       rotationY: 0,
-      speed: spec.speed,
+      speed: isHero ? Math.round(spec.speed * 1.1 * 10) / 10 : spec.speed,
       state: 'idle',
-      stance: 'aggressive',
-      activityAr:
-        u.kind === 'worker' ? 'يتفقد أحياء السكان والمزارع' : 'دورية حراسة لحماية الأهالي',
-      patrolling: true,
-      hp: spec.maxHp,
-      maxHp: spec.maxHp,
+      stance: isHero ? 'defensive' : 'aggressive',
+      activityAr: isHero
+        ? `القائد ${player.name} (يحرس المعقل تلقائياً)`
+        : u.kind === 'worker'
+          ? 'يتفقد أحياء السكان والمزارع'
+          : 'دورية حراسة لحماية الأهالي',
+      patrolling: !isHero,
+      hp: unitMaxHp,
+      maxHp: unitMaxHp,
+      ...(isHero ? { isPlayerHero: true, displayNameAr: player.name } : {}),
     };
+    if (isHero) {
+      player.heroUnitId = unitId;
+      player.characterStatus = 'active';
+    }
   });
 
   if (variant === 'frontier_raider') {
@@ -2075,6 +2105,10 @@ async function startServer() {
           u.ownerColor = target.color;
           u.secondaryColor = target.secondaryColor;
           u.bannerPattern = target.bannerPattern;
+          if (u.isHeroSultan) {
+            u.isPlayerHero = true;
+            target.heroUnitId = u.id;
+          }
         }
       }
       clearSingleAiPlayer(mirqabId);
@@ -2083,6 +2117,9 @@ async function startServer() {
       if (p.id !== target.id && p.isSultanHassan) p.isSultanHassan = false;
     }
     target.isSultanHassan = true;
+    target.commanderRank = 4;
+    target.characterStatus = 'active';
+    target.characterCreated = true;
     target.factionName = `السلطان حسن (${target.name}) — الدولة السندية`;
     if (worldState.directorConfig) {
       worldState.directorConfig.sultanHassanAssignedUid = target.uid ?? target.id;
@@ -2436,7 +2473,38 @@ async function startServer() {
       return;
     }
 
+    if (action === 'new_season') {
+      const nextNum = (worldState.season?.seasonNumber ?? 1) + 1;
+      worldState.season = {
+        seasonNumber: nextNum,
+        seasonNameAr: `الموسم #${nextNum} — صراع الإمارات والممالك`,
+        startedAtMs: Date.now(),
+      };
+      performWorldReset();
+      res.json({
+        ok: true,
+        season: worldState.season,
+        message: `انطلق ${worldState.season.seasonNameAr} بعالم جديد بالكامل`,
+      });
+      return;
+    }
+
     res.status(400).json({ ok: false, error: 'Unknown admin action' });
+  });
+
+  app.post('/api/admin/new-season', requireAdmin, (_req, res) => {
+    const nextNum = (worldState.season?.seasonNumber ?? 1) + 1;
+    worldState.season = {
+      seasonNumber: nextNum,
+      seasonNameAr: `الموسم #${nextNum} — صراع الإمارات والممالك`,
+      startedAtMs: Date.now(),
+    };
+    performWorldReset();
+    res.json({
+      ok: true,
+      season: worldState.season,
+      message: `انطلق ${worldState.season.seasonNameAr} بعالم جديد بالكامل`,
+    });
   });
 
   app.delete('/api/kingdom', requireAuth, async (req: AuthRequest, res) => {
@@ -2497,12 +2565,18 @@ async function startServer() {
       p.trainingQueue = [];
       p.isDefeated = false;
       p.isSultanHassan = false;
+      p.characterCreated = false;
+      p.characterStatus = 'active';
+      p.commanderRank = 1;
+      p.capturedNodesCount = 0;
+      p.capturedCitiesCount = 0;
+      p.heroUnitId = null;
       p.kills = 0;
       p.losses = 0;
       p.structuresRazed = 0;
       p.camera.targetX = slot.x;
       p.camera.targetZ = slot.z;
-      spawnPlayerInitialBase(p, slot.x, slot.z, 'full_capital');
+      spawnPlayerInitialBase(p, slot.x, slot.z, 'starter_settlement');
     });
 
     const curDiff = worldState.directorConfig?.banditDifficulty ?? worldState.pveTheater?.difficulty ?? 'balanced';
@@ -2649,6 +2723,12 @@ async function startServer() {
         packetsSent: 1,
         isAi: false,
         isDefeated: false,
+        characterCreated: false,
+        characterStatus: 'active',
+        commanderRank: 1,
+        capturedNodesCount: 0,
+        capturedCitiesCount: 0,
+        heroUnitId: null,
         kills: 0,
         losses: 0,
         structuresRazed: 0,
@@ -2674,7 +2754,7 @@ async function startServer() {
       }
 
       ensureSectorsMaterialized(spawnSlot.x, spawnSlot.z, 1280);
-      spawnPlayerInitialBase(newPlayer, spawnSlot.x, spawnSlot.z, 'full_capital');
+      spawnPlayerInitialBase(newPlayer, spawnSlot.x, spawnSlot.z, 'starter_settlement');
     }
 
     const welcomeSlice = filterWorldSliceForPlayer(playerId, true, true);
@@ -2986,6 +3066,19 @@ async function startServer() {
                 return;
               }
             }
+            const requiredRank = getRequiredRankForStructure(kind);
+            const currentRank = player.commanderRank ?? 1;
+            if (!player.isSultanHassan && currentRank < requiredRank) {
+              const reqRankSpec = COMMANDER_RANK_SPECS[requiredRank];
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_PLACE_STRUCTURE',
+                ok: false,
+                message: `يتطلب تشييد ${spec.labelAr} رتبة «${reqRankSpec.titleAr}» — أكمل شروط الرتبة أولاً!`,
+              });
+              return;
+            }
+
             const urbanReport = evaluateKingdomUrbanization(
               playerStructures,
               normalizeCultureKind(player.culture),
@@ -3677,6 +3770,187 @@ async function startServer() {
               cmd: 'C2S_CLAIM_ROLE',
               ok: transfer.ok,
               message: transfer.message,
+            });
+            break;
+          }
+
+          case 'C2S_CREATE_CHARACTER': {
+            const rawName = String(packet.payload?.name || '').trim().slice(0, 32);
+            const primaryColor =
+              typeof packet.payload?.primaryColor === 'string' &&
+              /^#[0-9a-fA-F]{3,8}$/.test(packet.payload.primaryColor)
+                ? packet.payload.primaryColor
+                : player.color;
+            const secondaryColor =
+              typeof packet.payload?.secondaryColor === 'string' &&
+              /^#[0-9a-fA-F]{3,8}$/.test(packet.payload.secondaryColor)
+                ? packet.payload.secondaryColor
+                : player.secondaryColor ?? '#fbbf24';
+            const rawPattern = packet.payload?.bannerPattern as BannerPatternKind | undefined;
+            const bannerPattern =
+              rawPattern && BANNER_PATTERN_SPECS[rawPattern]
+                ? rawPattern
+                : player.bannerPattern ?? 'crescent_star';
+            const culture = packet.payload?.culture
+              ? normalizeCultureKind(String(packet.payload.culture))
+              : normalizeCultureKind(player.culture);
+            const startMode =
+              packet.payload?.startMode === 'sultan_hassan' ? 'sultan_hassan' : 'independent';
+
+            const finalName = rawName || player.name || 'أمير ثار أحمد';
+            player.name = finalName;
+            player.factionName = `إمارة ${finalName}`;
+            player.color = primaryColor;
+            player.secondaryColor = secondaryColor;
+            player.bannerPattern = bannerPattern;
+            player.culture = culture;
+            player.characterCreated = true;
+
+            const wasDead = player.characterStatus === 'dead' || player.isDefeated;
+            if (wasDead) {
+              // Fresh new character after permadeath — spawn a new starter settlement in a safe slot
+              for (const sid of Object.keys(worldState.structures)) {
+                if (worldState.structures[sid].ownerId === player.id) {
+                  delete worldState.structures[sid];
+                }
+              }
+              for (const uid of Object.keys(worldState.units)) {
+                if (worldState.units[uid].ownerId === player.id) {
+                  delete worldState.units[uid];
+                }
+              }
+              const safeSlots = [
+                SPAWN_PLATEAUS[4],
+                SPAWN_PLATEAUS[14],
+                SPAWN_PLATEAUS[18],
+                SPAWN_PLATEAUS[15],
+                SPAWN_PLATEAUS[29],
+                SPAWN_PLATEAUS[8],
+              ];
+              const slot = safeSlots[Math.floor(Math.random() * safeSlots.length)];
+              player.resources = {
+                wood: 750,
+                stone: 650,
+                gold: 500,
+                food: 550,
+                cloth: 380,
+                horses: 260,
+              };
+              player.trainingQueue = [];
+              player.isDefeated = false;
+              player.isSultanHassan = false;
+              player.characterStatus = 'active';
+              player.commanderRank = 1;
+              player.capturedNodesCount = 0;
+              player.capturedCitiesCount = 0;
+              player.kills = 0;
+              player.losses = 0;
+              player.structuresRazed = 0;
+              player.fallenAtMs = undefined;
+              player.killedByNameAr = undefined;
+              player.camera.targetX = slot.x;
+              player.camera.targetZ = slot.z;
+              ensureSectorsMaterialized(slot.x, slot.z, 1280);
+              spawnPlayerInitialBase(player, slot.x, slot.z, 'starter_settlement');
+            } else {
+              // Sync colors/name/culture onto existing starter base & hero
+              for (const st of Object.values(worldState.structures)) {
+                if (st.ownerId === player.id) {
+                  st.ownerColor = primaryColor;
+                  st.secondaryColor = secondaryColor;
+                  st.bannerPattern = bannerPattern;
+                  st.culture = culture;
+                }
+              }
+              for (const u of Object.values(worldState.units)) {
+                if (u.ownerId === player.id) {
+                  u.ownerColor = primaryColor;
+                  u.secondaryColor = secondaryColor;
+                  u.bannerPattern = bannerPattern;
+                  if (u.isPlayerHero) {
+                    u.displayNameAr = finalName;
+                    u.activityAr = `القائد ${finalName} (يحرس المعقل تلقائياً)`;
+                  }
+                }
+              }
+            }
+
+            if (
+              startMode === 'sultan_hassan' &&
+              worldState.directorConfig?.sultanHassanMode === 'human_claimable' &&
+              !Object.values(worldState.players).some(
+                (p) => !p.isAi && p.isSultanHassan && p.id !== player.id
+              )
+            ) {
+              transferSultanHassanToHuman(player.id);
+              const mirqab = SPAWN_PLATEAUS[0];
+              player.camera.targetX = mirqab.x;
+              player.camera.targetZ = mirqab.z;
+            }
+
+            structuresDirty = true;
+            broadcastWorldSnapshot(`دخل القائد ${player.name} مسرح الموسم`);
+            sendPacket(ws, 'S2C_PACKET_ACK', {
+              ackSeq: packet.seq,
+              cmd: 'C2S_CREATE_CHARACTER',
+              ok: true,
+              message: `أهلاً بك يا ${player.name}! قائدك على الخريطة ومعقلك جاهز للتطوير.`,
+            });
+            break;
+          }
+
+          case 'C2S_FOUND_EXILE_KEEP': {
+            if (player.characterStatus !== 'exile_fleeing' || !player.heroUnitId) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_FOUND_EXILE_KEEP',
+                ok: false,
+                message: 'لا يمكنك تأسيس معقل ثورة إلا إذا سقط معقلك وبقي قائدك حياً',
+              });
+              return;
+            }
+            const hero = worldState.units[player.heroUnitId];
+            if (!hero || hero.hp <= 0) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_FOUND_EXILE_KEEP',
+                ok: false,
+                message: 'القائد غير موجود لتأسيس المعقل',
+              });
+              return;
+            }
+            const fx = quantize(hero.x + 4);
+            const fz = quantize(hero.z + 4);
+            const keepId = nextEntityId('str');
+            const keepSpec = STRUCTURE_SPECS.keep;
+            worldState.structures[keepId] = {
+              id: keepId,
+              ownerId: player.id,
+              ownerColor: player.color,
+              secondaryColor: player.secondaryColor ?? '#fbbf24',
+              bannerPattern: player.bannerPattern ?? 'crescent_star',
+              kind: 'keep',
+              culture: normalizeCultureKind(player.culture),
+              level: 1,
+              x: fx,
+              z: fz,
+              rotationY: 0,
+              hp: keepSpec.maxHp,
+              maxHp: keepSpec.maxHp,
+              createdAtTick: worldState.tick,
+            };
+            player.characterStatus = 'active';
+            player.resources.wood += 300;
+            player.resources.stone += 250;
+            player.resources.food += 250;
+            player.resources.gold += 200;
+            structuresDirty = true;
+            broadcastWorldSnapshot(`أسّس القائد ${player.name} معقلاً جديداً وأشعل راية الثورة!`);
+            sendPacket(ws, 'S2C_PACKET_ACK', {
+              ackSeq: packet.seq,
+              cmd: 'C2S_FOUND_EXILE_KEEP',
+              ok: true,
+              message: 'تم تأسيس معقلك الجديد بجانب القائد بنجاح!',
             });
             break;
           }
@@ -6481,47 +6755,239 @@ async function startServer() {
         }
       }
 
-      // Evaluate Dominion Victory & PvP/PvE Match Outcome
-      if (worldState.matchStatus?.status !== 'ended') {
-        const keepCountByHuman: Record<string, number> = {};
-        for (const s of Object.values(worldState.structures)) {
-          if (s.kind === 'keep' && s.hp > 0 && worldState.players[s.ownerId] && !worldState.players[s.ownerId].isAi) {
-            keepCountByHuman[s.ownerId] = (keepCountByHuman[s.ownerId] ?? 0) + 1;
-          }
-        }
-        const humansAlive = Object.values(worldState.players).filter(
-          (p) => !p.isAi && !p.isBandit && !p.isDefeated
-        );
-        const targetKeeps = worldState.directorConfig?.dominionVictoryTargetCities ?? 6;
-        const dominionWinner = humansAlive.find((p) => (keepCountByHuman[p.id] ?? 0) >= targetKeeps);
-        const majorAiAlive = Object.values(worldState.players).some(
-          (p) => p.isAi && !p.isBandit && !p.isDefeated
-        );
-        const lastHumanWinner =
-          !majorAiAlive && humansAlive.length === 1 ? humansAlive[0] : undefined;
+      // =========================================================================
+      // SEASONAL MMO LOOP: HERO PERMADEATH, FLEEING, CAPTURE & DUAL RANK PROGRESS
+      // =========================================================================
+      const allUnitsList = Object.values(worldState.units);
+      const allStructsList = Object.values(worldState.structures);
+      const allNodesList = Object.values(worldState.resourceNodes);
 
-        const matchWinner = dominionWinner ?? lastHumanWinner;
-        if (matchWinner) {
-          const reasonAr = dominionWinner
-            ? `سيطر ${matchWinner.factionName} على ${targetKeeps} قلاع ومدن كبرى في أرجاء المنطقة`
-            : `بقي ${matchWinner.factionName} صامداً ومنتصراً بعد سقوط القوى المعادية`;
-          const endedStatus: MatchStatusState = {
-            status: 'ended',
-            winnerPlayerId: matchWinner.id,
-            winnerNameAr: matchWinner.factionName,
-            victoryReasonAr: reasonAr,
-            endedAtMs: nowMs,
-          };
-          worldState.matchStatus = endedStatus;
-          for (const [pid, client] of clientSockets.entries()) {
-            sendPacket(client, 'S2C_MATCH_EVENT', {
-              outcome: pid === matchWinner.id ? 'victory' : 'defeat',
-              winnerPlayerId: matchWinner.id,
-              winnerNameAr: matchWinner.factionName,
-              reasonAr,
+      // 1. Check Hero Permadeath vs Keep-Fall Exile Fleeing for human players
+      for (const hp of Object.values(worldState.players)) {
+        if (hp.isAi || hp.isBandit || hp.characterStatus === 'dead') continue;
+        const heroAlive = Boolean(hp.heroUnitId && worldState.units[hp.heroUnitId]?.hp > 0);
+        if (hp.heroUnitId && !heroAlive) {
+          // Permanent Death of this character in this Season!
+          hp.characterStatus = 'dead';
+          hp.isDefeated = true;
+          hp.fallenAtMs = nowMs;
+          hp.heroUnitId = null;
+          hp.isSultanHassan = false;
+          for (const node of allNodesList) {
+            if (node.ownerId === hp.id) {
+              node.ownerId = null;
+              node.ownerColor = undefined;
+              node.ownerNameAr = undefined;
+              node.captureProgress = 0;
+              node.capturingOwnerId = null;
+              resourcesDirty = true;
+            }
+          }
+          for (const u of allUnitsList) {
+            if (u.ownerId === hp.id) {
+              delete worldState.units[u.id];
+            }
+          }
+          structuresDirty = true;
+          const sock = clientSockets.get(hp.id);
+          if (sock) {
+            sendPacket(sock, 'S2C_CHARACTER_DEATH', {
+              fallenNameAr: hp.name,
+              killerNameAr: hp.killedByNameAr ?? 'معركة ميدانية',
+              reasonAr:
+                'سقط قائدك في ساحة القتال! في نظام المواسم الموت دائم لهذه الشخصية — أنشئ شخصية جديدة لمواصلة المسيرة.',
             });
           }
-          broadcastWorldSnapshot(`انتهت المعركة الكبرى: انتصار ${matchWinner.factionName}!`);
+          broadcastWorldSnapshot(`سقط القائد ${hp.name} في المعركة وطُويت صفحته في هذا الموسم!`);
+        } else if (heroAlive) {
+          const hasKeep = allStructsList.some(
+            (s) => s.ownerId === hp.id && s.kind === 'keep' && s.hp > 0
+          );
+          if (!hasKeep && hp.characterStatus !== 'exile_fleeing') {
+            hp.characterStatus = 'exile_fleeing';
+            broadcastWorldSnapshot(
+              `سقط معقل ${hp.name} لكن قائده نجا! يمكنه الهرب وتأسيس إمارة أو ثورة جديدة.`
+            );
+          } else if (hasKeep && hp.characterStatus === 'exile_fleeing') {
+            hp.characterStatus = 'active';
+          }
+        }
+      }
+
+      // 2. Banner-Raising Capture on Resource Nodes (~6 seconds) + Passive Yield
+      for (const node of allNodesList) {
+        if (node.amount <= 0) continue;
+        let soleFactionId: string | null = null;
+        let contested = false;
+        for (const u of allUnitsList) {
+          if (u.hp <= 0) continue;
+          const uOwner = worldState.players[u.ownerId];
+          if (!uOwner || uOwner.isBandit) continue;
+          if (Math.hypot(u.x - node.x, u.z - node.z) <= 16) {
+            if (!soleFactionId) {
+              soleFactionId = u.ownerId;
+            } else if (soleFactionId !== u.ownerId) {
+              contested = true;
+              break;
+            }
+          }
+        }
+
+        if (!contested && soleFactionId && node.ownerId !== soleFactionId) {
+          const capturer = worldState.players[soleFactionId];
+          if (capturer && !capturer.isDefeated) {
+            if (node.capturingOwnerId === soleFactionId) {
+              node.captureProgress = Math.min(100, (node.captureProgress ?? 0) + 18);
+            } else {
+              node.capturingOwnerId = soleFactionId;
+              node.captureProgress = 18;
+            }
+            resourcesDirty = true;
+            if ((node.captureProgress ?? 0) >= 100) {
+              node.ownerId = soleFactionId;
+              node.ownerColor = capturer.color;
+              node.ownerNameAr = capturer.name;
+              node.capturingOwnerId = null;
+              node.captureProgress = 100;
+              resourcesDirty = true;
+              pushCombatEvent({
+                kind: 'loot_recovered',
+                fromX: node.x,
+                fromZ: node.z,
+                toX: node.x,
+                toZ: node.z,
+                attackerOwnerId: soleFactionId,
+                color: capturer.color,
+                labelAr: `سيطر ${capturer.name} على مصدر ${node.kind}`,
+              });
+            }
+          }
+        } else if (contested || (!soleFactionId && node.capturingOwnerId)) {
+          if (node.captureProgress && node.captureProgress > 0 && node.captureProgress < 100) {
+            node.captureProgress = Math.max(0, node.captureProgress - 10);
+            if (node.captureProgress === 0) node.capturingOwnerId = null;
+          }
+        }
+
+        // Steady passive income from captured resource nodes (no 24/7 worker micro required)
+        if (node.ownerId) {
+          const ownerP = worldState.players[node.ownerId];
+          if (ownerP && !ownerP.isDefeated) {
+            const yieldAmt = Math.min(4, node.amount);
+            ownerP.resources[node.kind] = Math.min(
+              250_000,
+              (ownerP.resources[node.kind] ?? 0) + yieldAmt
+            );
+            node.amount = Math.max(100, node.amount - Math.floor(yieldAmt * 0.25));
+          }
+        }
+      }
+
+      // 3. Banner-Raising Capture on Undefended Enemy Keeps (~8 seconds)
+      for (const keep of allStructsList) {
+        if (keep.kind !== 'keep' || keep.hp <= 0) continue;
+        let hasDefenders = false;
+        let soleAttackerId: string | null = null;
+        let contestedAttacker = false;
+        for (const u of allUnitsList) {
+          if (u.hp <= 0) continue;
+          const dist = Math.hypot(u.x - keep.x, u.z - keep.z);
+          if (dist > 26) continue;
+          if (u.ownerId === keep.ownerId) {
+            hasDefenders = true;
+            break;
+          }
+          const uOwner = worldState.players[u.ownerId];
+          if (!uOwner || uOwner.isBandit || !isHostileOwners(u.ownerId, keep.ownerId)) continue;
+          if (dist <= 24) {
+            if (!soleAttackerId) soleAttackerId = u.ownerId;
+            else if (soleAttackerId !== u.ownerId) {
+              contestedAttacker = true;
+              break;
+            }
+          }
+        }
+
+        if (!hasDefenders && !contestedAttacker && soleAttackerId) {
+          const attackerP = worldState.players[soleAttackerId];
+          if (attackerP && !attackerP.isDefeated) {
+            if (keep.capturingOwnerId === soleAttackerId) {
+              keep.captureProgress = Math.min(100, (keep.captureProgress ?? 0) + 13);
+            } else {
+              keep.capturingOwnerId = soleAttackerId;
+              keep.captureProgress = 13;
+            }
+            structuresDirty = true;
+            if ((keep.captureProgress ?? 0) >= 100) {
+              const prevOwnerId = keep.ownerId;
+              const prevOwnerName = worldState.players[prevOwnerId]?.factionName ?? 'المعقل';
+              for (const st of allStructsList) {
+                if (st.ownerId === prevOwnerId && Math.hypot(st.x - keep.x, st.z - keep.z) <= 85) {
+                  st.ownerId = soleAttackerId;
+                  st.ownerColor = attackerP.color;
+                  st.secondaryColor = attackerP.secondaryColor;
+                  st.bannerPattern = attackerP.bannerPattern;
+                  st.captureProgress = 0;
+                  st.capturingOwnerId = null;
+                  st.hp = Math.max(st.hp, Math.round(st.maxHp * 0.55));
+                }
+              }
+              attackerP.capturedCitiesCount = (attackerP.capturedCitiesCount ?? 0) + 1;
+              structuresDirty = true;
+              broadcastWorldSnapshot(
+                `رفع ${attackerP.name} رايته فوق ${prevOwnerName} واستولى على المدينة!`
+              );
+            }
+          }
+        } else if (keep.captureProgress && keep.captureProgress > 0) {
+          keep.captureProgress = Math.max(0, keep.captureProgress - 10);
+          if (keep.captureProgress === 0) keep.capturingOwnerId = null;
+        }
+      }
+
+      // 4. Live Commander Rank Progression (Economy + Field/Capture)
+      for (const hp of Object.values(worldState.players)) {
+        if (hp.isAi || hp.isBandit || hp.characterStatus === 'dead') continue;
+        const myStructs = allStructsList.filter((s) => s.ownerId === hp.id && s.hp > 0);
+        const ownedNodes = allNodesList.filter((n) => n.ownerId === hp.id && n.amount > 0).length;
+        const urbanRep = evaluateKingdomUrbanization(
+          myStructs,
+          normalizeCultureKind(hp.culture),
+          worldState.climate,
+          getBiomeAt,
+          (sx, sz) => getEffectiveClimateAt(sx, sz, worldState.climate)
+        );
+        const rankRep = evaluateCommanderRank(
+          myStructs,
+          urbanRep.tier,
+          ownedNodes,
+          hp.capturedCitiesCount ?? 0,
+          hp.kills ?? 0,
+          hp.isSultanHassan
+        );
+        const prevRank = hp.commanderRank ?? 1;
+        hp.capturedNodesCount = ownedNodes;
+        hp.commanderRank = rankRep.rank;
+        if (rankRep.rank > prevRank) {
+          if (hp.heroUnitId && worldState.units[hp.heroUnitId]) {
+            const hUnit = worldState.units[hp.heroUnitId];
+            const bonusDiff =
+              COMMANDER_RANK_SPECS[rankRep.rank].heroHpBonus -
+              COMMANDER_RANK_SPECS[prevRank].heroHpBonus;
+            if (bonusDiff > 0) {
+              hUnit.maxHp += bonusDiff;
+              hUnit.hp = Math.min(hUnit.maxHp, hUnit.hp + bonusDiff);
+            }
+          }
+          const sock = clientSockets.get(hp.id);
+          if (sock) {
+            sendPacket(sock, 'S2C_PACKET_ACK', {
+              ackSeq: 0,
+              cmd: 'C2S_HANDSHAKE',
+              ok: true,
+              message: `ترقّى ${hp.name} إلى رتبة «${rankRep.spec.titleAr}» وفُتحت مبانٍ جديدة!`,
+            });
+          }
         }
       }
 
@@ -6879,6 +7345,7 @@ async function startServer() {
           diplomacy: worldState.diplomacy,
           directorConfig: worldState.directorConfig,
           matchStatus: worldState.matchStatus,
+          season: worldState.season,
           ...(slice.structures ? { structures: slice.structures } : {}),
           ...(slice.resourceNodes ? { resourceNodes: slice.resourceNodes } : {}),
         });
