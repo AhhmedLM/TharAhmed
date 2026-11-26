@@ -2096,7 +2096,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
           <ChiseledSeparatorSvg className="w-1 h-5 hidden sm:block shrink-0" />
 
           {/* 6 Pure 2000s Resource Counters (Single-line Scrollable on Mobile) */}
-          <div className="flex flex-nowrap items-center gap-1 sm:gap-2 min-w-0 overflow-x-auto no-scrollbar">
+          <div className="flex flex-nowrap items-center gap-0.5 sm:gap-1 lg:gap-1.5 min-w-0 overflow-x-auto no-scrollbar">
             {(['wood', 'stone', 'gold', 'food', 'cloth', 'horses'] as ResourceKind[]).map(
               (rKind, idx) => {
                 const meta = RESOURCE_META[rKind];
@@ -2114,16 +2114,16 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                       assignWorkerToResourceKind(rKind, false);
                     }}
                     title={`${meta.nameAr}: ${currentVal} / ${economyStats.storageCap} (+${ratePerMin}/د · عمال: ${assignedWorkers}) — نقرة يسار لفتح الخزانة، نقرة يمين لإرسال عامل`}
-                    className={`h-6 sm:h-7 px-1 sm:px-1.5 flex items-center gap-1 text-right shrink-0 cursor-pointer hover:brightness-125 transition ${
-                      idx > 0 ? 'border-r border-[#5c4320]/60 pr-1 sm:pr-2' : ''
+                    className={`h-6 sm:h-7 px-0.5 sm:px-1 flex items-center gap-0.5 sm:gap-1 text-right shrink-0 cursor-pointer hover:brightness-125 transition ${
+                      idx > 0 ? 'border-r border-[#5c4320]/60 pr-1 sm:pr-1.5' : ''
                     }`}
                   >
                     <ResourceArtworkSvg
                       kind={rKind}
-                      className="w-3.5 h-3.5 sm:w-[18px] sm:h-[18px] shrink-0"
+                      className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"
                     />
                     <span
-                      className={`text-[10.5px] sm:text-xs font-mono font-bold tabular-nums ${meta.colorText} whitespace-nowrap`}
+                      className={`text-[10px] sm:text-[11px] lg:text-xs font-mono font-bold tabular-nums ${meta.colorText} whitespace-nowrap`}
                     >
                       {currentVal}
                     </span>
@@ -2159,7 +2159,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
             <span className="font-mono font-bold whitespace-nowrap">
               {myUnits.length}/{economyStats.maxPopulation}
             </span>
-            <span className="text-[9px] font-mono text-[#f6d99a] hidden md:inline whitespace-nowrap border-r border-[#5c4223]/70 pr-1.5 mr-0.5">
+            <span className="text-[9px] font-mono text-[#f6d99a] hidden xl:inline whitespace-nowrap border-r border-[#5c4223]/70 pr-1.5 mr-0.5">
               {economyStats.civilianPopulation >= 1000
                 ? `${(economyStats.civilianPopulation / 1000).toFixed(1)}k`
                 : economyStats.civilianPopulation}{' '}
@@ -3286,9 +3286,9 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
             </div>
 
             {/* LEFT SECTION: COMPACT AGED VELLUM PARCHMENT SCROLL PLAQUE */}
-            <div className="rts2k-hud-parchment relative w-full sm:w-[275px] md:w-[325px] lg:w-[410px] flex-1 sm:flex-none sm:h-full rts2k-parchment px-2.5 sm:px-3 py-1 flex flex-col justify-between shrink-0 overflow-hidden">
-              <BrassCornerMountSvg corner="tr" className="hidden sm:block absolute top-0.5 right-0.5 pointer-events-none" />
-              <BrassCornerMountSvg corner="tl" className="hidden sm:block absolute top-0.5 left-0.5 pointer-events-none" />
+            <div className="rts2k-hud-parchment relative w-full sm:w-[290px] md:w-[335px] lg:w-[410px] flex-1 sm:flex-none sm:h-full rts2k-parchment px-3 sm:px-5 py-1.5 flex flex-col justify-between shrink-0 overflow-hidden">
+              <BrassCornerMountSvg corner="tr" className="hidden xl:block opacity-75 absolute top-0.5 right-0.5 pointer-events-none" />
+              <BrassCornerMountSvg corner="tl" className="hidden xl:block opacity-75 absolute top-0.5 left-0.5 pointer-events-none" />
 
               {buildMode ? (
                 /* PARCHMENT CONTEXT A: ACTIVE BUILD PLACEMENT ON MAP */
