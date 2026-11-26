@@ -615,7 +615,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
   const [autoMatchBiomeCulture, setAutoMatchBiomeCulture] = useState<boolean>(false);
   const [touchMode, setTouchMode] = useState<TouchInteractionMode>('pan');
   const [qualityMode, setQualityMode] = useState<RenderQualityMode>('balanced');
-  const [pixelScale, setPixelScale] = useState<PixelScaleMode>(2);
+  const [pixelScale, setPixelScale] = useState<PixelScaleMode>(1);
   const [projectionMode, setProjectionMode] =
     useState<CameraProjectionMode>('isometric_2000s');
   const [activePopup, setActivePopup] = useState<PopupModalKind>(null);

@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import {
-  BANDIT_CLAN_OUTFIT_AR,
   BanditCampArchetype,
   BanditRoleKind,
   BannerPatternKind,
@@ -8,6 +7,10 @@ import {
   UnitKind,
 } from '../shared/protocol';
 import { applyRetroPixelShader } from './proceduralBlockout';
+import {
+  createHighCraftBanditCanvas,
+  createHighCraftUnitCanvas,
+} from './unitPixelArt';
 
 /**
  * ============================================================================
@@ -101,462 +104,6 @@ const UNIT_SPRITE_MATERIAL_CACHE = new Map<
   { frame0: THREE.MeshBasicMaterial; frame1: THREE.MeshBasicMaterial }
 >();
 
-function drawMiniBannerEmblem(
-  ctx: CanvasRenderingContext2D,
-  pattern: BannerPatternKind,
-  cx: number,
-  cy: number,
-  colorHex: string
-) {
-  ctx.fillStyle = colorHex;
-  if (pattern === 'crescent_star') {
-    // 5x5 pixel crescent + star
-    ctx.fillRect(cx - 1, cy - 2, 2, 1);
-    ctx.fillRect(cx - 2, cy - 1, 1, 3);
-    ctx.fillRect(cx - 1, cy + 2, 2, 1);
-    ctx.fillRect(cx + 1, cy, 1, 1);
-  } else if (pattern === 'crossed_swords') {
-    // 5x5 diagonal X blades
-    for (let i = -2; i <= 2; i++) {
-      ctx.fillRect(cx + i, cy + i, 1, 1);
-      ctx.fillRect(cx + i, cy - i, 1, 1);
-    }
-  } else if (pattern === 'crusader_cross') {
-    // Bold 5x5 heraldic cross
-    ctx.fillRect(cx, cy - 2, 1, 5);
-    ctx.fillRect(cx - 2, cy, 5, 1);
-  } else if (pattern === 'royal_lion') {
-    // Crowned heraldic crest
-    ctx.fillRect(cx - 2, cy - 2, 1, 2);
-    ctx.fillRect(cx, cy - 2, 1, 2);
-    ctx.fillRect(cx + 2, cy - 2, 1, 2);
-    ctx.fillRect(cx - 2, cy, 5, 1);
-    ctx.fillRect(cx - 1, cy + 1, 3, 2);
-  } else if (pattern === 'nordic_raven') {
-    // Spread wings + head
-    ctx.fillRect(cx, cy - 2, 1, 4);
-    ctx.fillRect(cx - 2, cy - 1, 5, 1);
-    ctx.fillRect(cx - 1, cy, 3, 1);
-  } else {
-    // imperial_sun: radiant sun diamond
-    ctx.fillRect(cx - 1, cy - 1, 3, 3);
-    ctx.fillRect(cx, cy - 2, 1, 5);
-    ctx.fillRect(cx - 2, cy, 5, 1);
-  }
-}
-
-function createUnitPixelTexture(
-  kind: UnitKind,
-  factionColor: string,
-  frame: 0 | 1,
-  secondaryColor = '#fbbf24',
-  bannerPattern: BannerPatternKind = 'crescent_star'
-): THREE.CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = 24;
-  canvas.height = 24;
-  const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 24, 24);
-
-  const fCol = new THREE.Color(factionColor);
-  const fDark = fCol.clone().multiplyScalar(0.65);
-  const fLight = fCol.clone().lerp(new THREE.Color(0xffffff), 0.32);
-
-  const sCol = new THREE.Color(secondaryColor || '#fbbf24');
-  const sHex = `#${sCol.getHexString()}`;
-
-  const palette: Record<string, string> = {
-    '#': '#0f172a', // 1px Black/Dark-Slate Sprite Outline
-    S: '#f1c27d', // Skin tone
-    s: '#d2995b', // Skin shadow
-    F: `#${fCol.getHexString()}`, // Faction primary color
-    f: `#${fDark.getHexString()}`, // Faction shadow color
-    L: `#${fLight.getHexString()}`, // Faction highlight
-    M: '#cbd5e1', // Bright steel armor / blade
-    m: '#64748b', // Dark steel / chainmail
-    W: '#ffffff', // Specular glint
-    B: '#78350f', // Wood / brown leather / horse coat
-    b: '#451a03', // Dark leather / hooves
-    G: sHex, // Faction secondary trim / shield border / horse barding trim
-  };
-
-  if (kind === 'worker') {
-    // Peasant Builder / Gatherer with Faction Hood & Pickaxe/Axe
-    const grid0: PixelGrid = [
-      '........................',
-      '.........######.........',
-      '........#FFFFFF#........',
-      '.......#FFLLLLFF#.......',
-      '.......#fSSSSSSf#.......',
-      '.......#SSSSSSSS#.......',
-      '........#sSSSSs#...###..',
-      '.......##########.#MWM#.',
-      '......#FFffffffFF##MMM#.',
-      '.....#FFFffffffFFF#B#...',
-      '.....#fFFffffffFFf#B#...',
-      '.....#sS#FFFFFF#Ss#B#...',
-      '......##.#fFFf#.###B#...',
-      '........#BBBBBB#..#B#...',
-      '........#BB##BB#...#....',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '.........######.........',
-      '........#FFFFFF#........',
-      '.......#FFLLLLFF#.......',
-      '.......#fSSSSSSf#..###..',
-      '.......#SSSSSSSS#.#MWM#.',
-      '........#sSSSSs#..#MMM#.',
-      '.......##########..#B#..',
-      '......#FFffffffFF#.#B#..',
-      '.....#FFFffffffFFF##B#..',
-      '.....#fFFffffffFFf#B#...',
-      '......#S#FFFFFF#Ss#.....',
-      '.......#.#fFFf#.###.....',
-      '........#BBBBBB#........',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (kind === 'infantry') {
-    // Medieval Man-at-Arms with Crusader Helmet, Faction Kite Shield & Halberd Pike
-    const grid0: PixelGrid = [
-      '.................##.....',
-      '................#WM#....',
-      '.........######.#MM#....',
-      '........#MMMMMM##mM#....',
-      '.......#MWMMMMMM#B#.....',
-      '.......#m######m#B#.....',
-      '.......#mSSSSSSm#B#.....',
-      '.....#######m####B#.....',
-      '....#GGGGGGG#MMm#B#.....',
-      '...#GFFFFFFFG#MM#B#.....',
-      '...#GFLLLLLFG#mS#B#.....',
-      '...#GFFGGGFFG###B#......',
-      '....#GFFFFFG#mm#B#......',
-      '.....#GfffG#MMM#B#......',
-      '......#GGG##m#m#B#......',
-      '.......###.#M#M##.......',
-      '..........#bb#bb#.......',
-      '..........###.###.......',
-    ];
-    const grid1: PixelGrid = [
-      '................##......',
-      '...............#WM#.....',
-      '.........######.#MM#....',
-      '........#MMMMMM##mM#....',
-      '.......#MWMMMMMM#B#.....',
-      '.......#m######m#B#.....',
-      '.......#mSSSSSSm#B#.....',
-      '.....#######m####B#.....',
-      '....#GGGGGGG#MMm#B#.....',
-      '...#GFFFFFFFG#MM#B#.....',
-      '...#GFLLLLLFG#mS#B#.....',
-      '...#GFFGGGFFG###B#......',
-      '....#GFFFFFG#mm#B#......',
-      '.....#GfffG#MMM#B#......',
-      '......#GGG#m###m#.......',
-      '.......####M#.#M#.......',
-      '.........#bb#..#bb#.....',
-      '.........###....###.....',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (kind === 'spearman') {
-    // Pikeman / Halberdier with Steel Kettle Helm, Long Anti-Cavalry Pike & Heraldic Buckler
-    const grid0: PixelGrid = [
-      '...................##...',
-      '..................#WM#..',
-      '........######...#MM#...',
-      '.......#MMMMMM#.#B#.....',
-      '......#MMMMMMMM#B#......',
-      '.......#mSSSSm#B#.......',
-      '.......#mSSSS#B#........',
-      '......###FFFF#B#........',
-      '.....#GGGFFFF#B#........',
-      '....#GFFGFFFF#B#........',
-      '....#GFFGffFF#B#........',
-      '.....#GGG#B#f#B#........',
-      '......###B###m#.........',
-      '........#B#m#.#m#.......',
-      '.......#B##M#.#M#.......',
-      '..........#bb#bb#.......',
-      '..........###.###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '..................##....',
-      '.................#WM#...',
-      '........######..#MM#....',
-      '.......#MMMMMM##B#......',
-      '......#MMMMMMMMB#.......',
-      '.......#mSSSSm#B#.......',
-      '.......#mSSSS#B#........',
-      '......###FFFF#B#........',
-      '.....#GGGFFFF#B#........',
-      '....#GFFGFFFF#B#........',
-      '....#GFFGffFF#B#........',
-      '.....#GGG#B#f#B#........',
-      '......###B###m#.........',
-      '........#B#m###m#.......',
-      '.......#B##M#..#M#......',
-      '.........#bb#...#bb#....',
-      '.........###.....###....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (kind === 'archer') {
-    // Longbowman / Fire Archer with Faction Hood, Quiver, Composite Bow & Flaming Arrow
-    palette.R = '#f97316'; // Fire arrow tip flame
-    const grid0: PixelGrid = [
-      '........................',
-      '........######...##.....',
-      '.......#FFFFFF#.#BB#....',
-      '......#FFLLLLFF#.#BB#...',
-      '......#fSSSSSSf#..#BB#..',
-      '....#B#SSSSSSSS#...#BB#.',
-      '....#B##sSSSSs#....#WRR#',
-      '.....#B#########...#BB#.',
-      '.....#FFFFFFFFF#..#BB#..',
-      '....#FFGGGGGGGFF#.#BB#..',
-      '....#FFfffffffFF##BB#...',
-      '.....#sS#FFFF#Ss#.#.....',
-      '......##.#ff#.###.......',
-      '........#BBBBBB#........',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '........######....##....',
-      '.......#FFFFFF#..#BB#...',
-      '......#FFLLLLFF#..#BB#..',
-      '......#fSSSSSSf#...#BB#.',
-      '....#B#SSSSSSSS#...#WRR#',
-      '....#B##sSSSSs#....#BB#.',
-      '.....#B#########...#BB#.',
-      '.....#FFFFFFFFF#..#BB#..',
-      '....#FFGGGGGGGFF#.#BB#..',
-      '....#FFfffffffFF##BB#...',
-      '.....#sS#FFFF#Ss#.......',
-      '......##.#ff#.###.......',
-      '........#BBBBBB#........',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (kind === 'commander') {
-    // Royal Commander / Lord on White Royal Warhorse with Golden Crown, Flowing Cape & Royal Banner
-    const grid0: PixelGrid = [
-      '.......#.#.#.....####...',
-      '.......#GGG#....#GFFG#..',
-      '.......#GGG#....#FFFF#..',
-      '.......#SSS#....#GFFG#..',
-      '......##GGG##...#G##....',
-      '....##GGGGGGG##.#G#.....',
-      '...#FFGGGGGGGFF##G#.##..',
-      '..#FFFGGGGGGGFFF#G#WWM#.',
-      '..#fFFFFFFFFFFFF#G#WWWM#',
-      '..#ffWWWWWWWWWWWWWWWW#..',
-      '...##WWGGGGGGGGGGGGWW#..',
-      '....#WWFFFFFFFFFFFFWW#..',
-      '....#W#GGGGGGGGGGGG#W#..',
-      '....#m#WW#......#WW#m#..',
-      '.......#GG#....#GG#.....',
-      '.......###......###.....',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '.......#.#.#.....####...',
-      '.......#GGG#....#GFFG#..',
-      '.......#GGG#....#FFFF#..',
-      '.......#SSS#....#GFFG#..',
-      '......##GGG##...#G##....',
-      '....##GGGGGGG##.#G#.....',
-      '...#FFGGGGGGGFF##G#.##..',
-      '..#FFFGGGGGGGFFF#G#WWM#.',
-      '..#fFFFFFFFFFFFF#G#WWWM#',
-      '..#ffWWWWWWWWWWWWWWWW#..',
-      '...##WWGGGGGGGGGGGGWW#..',
-      '....#WWFFFFFFFFFFFFWW#..',
-      '....#W#GGGGGGGGGGGG#W#..',
-      '....#m##WW#....#WW##m#..',
-      '......#GG#......#GG#....',
-      '......###........###....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (kind === 'battering_ram') {
-    // Wheeled Armored Battering Ram with Pitched Roof, Faction Banner & Iron Ram Head
-    palette.R = '#9ca3af';
-    const grid0: PixelGrid = [
-      '........................',
-      '.........######.........',
-      '.......##FFFFFF##.......',
-      '......#FFBBBBBBFF#......',
-      '.....#FBBBBBBBBBBF#.....',
-      '....#BBBBBBBBBBBBBB#....',
-      '....#BbbbbbbbbbbbbB#....',
-      '....#B#GGGGGGGGGG#B#....',
-      '...##B#BBBBBBBBBB#B##...',
-      '..#MRR#bbbbbbbbbb#BB#...',
-      '..#MMRRBBBBBBBBBBBB#....',
-      '...#MR#BBBBBBBBBBBB#....',
-      '....###b########b###....',
-      '.....#bB#......#bB#.....',
-      '....#B#B#......#B#B#....',
-      '.....###........###.....',
-      '........................',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '.........######.........',
-      '.......##FFFFFF##.......',
-      '......#FFBBBBBBFF#......',
-      '.....#FBBBBBBBBBBF#.....',
-      '....#BBBBBBBBBBBBBB#....',
-      '....#BbbbbbbbbbbbbB#....',
-      '....#B#GGGGGGGGGG#B#....',
-      '.###B#BBBBBBBBBBBB##....',
-      '#MRR##bbbbbbbbbbbb#B#...',
-      '#MMRR#BBBBBBBBBBBBB#....',
-      '.#MR##BBBBBBBBBBBBB#....',
-      '....###b########b###....',
-      '.....#bB#......#bB#.....',
-      '....#B#B#......#B#B#....',
-      '.....###........###.....',
-      '........................',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (kind === 'trebuchet') {
-    // Heavy Counterweight Trebuchet with Tall Timber Frame, Counterweight Box & Blazing Boulder
-    palette.R = '#f97316';
-    const grid0: PixelGrid = [
-      '.................#RR#...',
-      '................#RYYR#..',
-      '...............##B##....',
-      '..............#BB#......',
-      '............##BB#.......',
-      '...........#BB#.........',
-      '.........##BB#..........',
-      '........#BBBB#..........',
-      '.......#BB#B#B#.........',
-      '......#BB##B##B#........',
-      '.....#GG#.#B#.#B#.......',
-      '....#GmmG##B###B##......',
-      '....#GmmG#BBBBBBBB#.....',
-      '....#GGGG#BbbbbbbB#.....',
-      '.....####b#......#b#....',
-      '........#B#......#B#....',
-      '........###......###....',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '......#RR#..............',
-      '.....#RYYR#.............',
-      '.......#BB##............',
-      '........##BB#...........',
-      '..........#BB##.........',
-      '...........##BB#........',
-      '..........#BBBB#........',
-      '.........#B#B#BB#.......',
-      '........#B##B##BB#......',
-      '.......#B#.#B#.#BB#.....',
-      '......#B#..#B#..#GG#....',
-      '.....##B###B##.#GmmG#...',
-      '....#BBBBBBBB#.#GmmG#...',
-      '....#BbbbbbbB#..#GG#....',
-      '.....#b#....#b#.........',
-      '.....#B#....#B#.........',
-      '.....###....###.........',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else {
-    // Armored Medieval Knight on Warhorse with Lance & Faction Barding
-    const grid0: PixelGrid = [
-      '...................##...',
-      '........####......#FF#..',
-      '.......#FFFF#.....#MM#..',
-      '.......#MMMM#....#MM#...',
-      '.......#mSSm#....#B#....',
-      '......##MMMM##..#B#.....',
-      '.....#FFFFFFFF#.#B#.##..',
-      '.....#FFGGGGFF##B##BBb#.',
-      '....##FFFFFFFF#B#BBBBb#.',
-      '...#BBBBBBBBBBBBBBBB#...',
-      '..#BBFFFFFFFFFFFFBB#....',
-      '..#B#GGGGGGGGGGGG#B#....',
-      '..#b#ffffffffffff#B#....',
-      '...#.#BB#....#BB#.#.....',
-      '.....#bb#....#bb#.......',
-      '.....###......###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '...................##...',
-      '........####......#FF#..',
-      '.......#FFFF#.....#MM#..',
-      '.......#MMMM#....#MM#...',
-      '.......#mSSm#....#B#....',
-      '......##MMMM##..#B#.....',
-      '.....#FFFFFFFF#.#B#.##..',
-      '.....#FFGGGGFF##B##BBb#.',
-      '....##FFFFFFFF#B#BBBBb#.',
-      '...#BBBBBBBBBBBBBBBB#...',
-      '..#BBFFFFFFFFFFFFBB#....',
-      '..#B#GGGGGGGGGGGG#B#....',
-      '..#b#ffffffffffff#B#....',
-      '....#BB#......#BB#......',
-      '...#bb#........#bb#.....',
-      '...###..........###.....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  }
-
-  // Stamp the player's chosen heraldic banner emblem onto the soldier's shield / banner / barding in secondaryColor!
-  if (kind === 'infantry') {
-    // Re-fill inner shield field with primary color and stamp the 5x5 secondary emblem on top
-    ctx.fillStyle = palette.F;
-    ctx.fillRect(5, 14, 5, 5);
-    drawMiniBannerEmblem(ctx, bannerPattern, 7, 16, sHex);
-  } else if (kind === 'spearman' || kind === 'archer') {
-    drawMiniBannerEmblem(ctx, bannerPattern, 9, 15, sHex);
-  } else if (kind === 'knight') {
-    // Stamp emblem onto knight's warhorse barding & lance pennant
-    ctx.fillStyle = palette.F;
-    ctx.fillRect(6, 15, 9, 3);
-    drawMiniBannerEmblem(ctx, bannerPattern, 10, 16, sHex);
-    ctx.fillStyle = sHex;
-    ctx.fillRect(19, 7, 2, 1);
-  } else if (kind === 'commander') {
-    // Stamp emblem onto commander's royal standard flag & warhorse barding
-    ctx.fillStyle = palette.F;
-    ctx.fillRect(17, 6, 4, 3);
-    ctx.fillStyle = sHex;
-    ctx.fillRect(18, 7, 2, 1);
-    drawMiniBannerEmblem(ctx, bannerPattern, 11, 16, sHex);
-  } else if (kind === 'worker') {
-    // Secondary belt & tunic badge on worker
-    ctx.fillStyle = sHex;
-    ctx.fillRect(9, 14, 5, 1);
-    ctx.fillRect(11, 13, 1, 3);
-  }
-
-  return finalizePixelTexture(canvas);
-}
-
 export function getUnitSpriteMaterials(
   kind: UnitKind,
   factionColor: string,
@@ -566,8 +113,12 @@ export function getUnitSpriteMaterials(
   const key = `${kind}_${factionColor}_${secondaryColor}_${bannerPattern}`;
   let cached = UNIT_SPRITE_MATERIAL_CACHE.get(key);
   if (!cached) {
-    const tex0 = createUnitPixelTexture(kind, factionColor, 0, secondaryColor, bannerPattern);
-    const tex1 = createUnitPixelTexture(kind, factionColor, 1, secondaryColor, bannerPattern);
+    const tex0 = finalizePixelTexture(
+      createHighCraftUnitCanvas(kind, factionColor, 0, secondaryColor, bannerPattern)
+    );
+    const tex1 = finalizePixelTexture(
+      createHighCraftUnitCanvas(kind, factionColor, 1, secondaryColor, bannerPattern)
+    );
     cached = {
       frame0: new THREE.MeshBasicMaterial({
         map: tex0,
@@ -601,277 +152,6 @@ export function getUnitSpriteMaterials(
   return cached;
 }
 
-function createBanditPixelTexture(
-  role: BanditRoleKind,
-  archetype: BanditCampArchetype,
-  frame: 0 | 1,
-  carryingLoot: boolean
-): THREE.CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = 24;
-  canvas.height = 24;
-  const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 24, 24);
-
-  const outfit = BANDIT_CLAN_OUTFIT_AR[archetype] ?? BANDIT_CLAN_OUTFIT_AR.forest_ambush;
-  const cloakCol = new THREE.Color(outfit.cloakHex);
-  const cloakDark = cloakCol.clone().multiplyScalar(0.62);
-  const cloakLight = cloakCol.clone().lerp(new THREE.Color(0xd6d3d1), 0.18);
-  const hoodCol = new THREE.Color(outfit.hoodHex);
-  const sashCol = new THREE.Color(outfit.sashHex);
-
-  const palette: Record<string, string> = {
-    '#': '#09090b', // Crisp dark outline
-    H: `#${hoodCol.getHexString()}`, // Hood / dark litham / fur cap
-    C: `#${cloakCol.getHexString()}`, // Tattered cloak / bandit tunic
-    c: `#${cloakDark.getHexString()}`, // Deep cloak folds & tattered hem
-    L: `#${cloakLight.getHexString()}`, // Weathered fabric highlight / fur trim
-    R: `#${sashCol.getHexString()}`, // Bandit mask scarf / waist sash
-    S: '#dfb07c', // Weathered skin
-    E: '#fef08a', // Fierce bandit eye glint above dark mask
-    M: '#94a3b8', // Dull jagged iron blade
-    m: '#52525b', // Rusted iron / dark hilt
-    B: '#78350f', // Rough wood / leather boots / lean stolen mount
-    b: '#3b1806', // Dark leather / horse mane & hooves
-    W: '#a16207', // Cracked wooden buckler / hunting bow
-    K: '#ca8a04', // Burlap loot sack
-    G: '#fde047', // Stolen gold coins peeking from sack
-  };
-
-  if (role === 'cutthroat') {
-    // Hooded Masked Cutthroat with Tattered Cloak, Jagged Hatchet & Curved Dagger
-    const grid0: PixelGrid = [
-      '........................',
-      '........######...###....',
-      '.......#HHHHHH#.#MMm#...',
-      '......#HHLLLLHH##MmM#...',
-      '......#HHESEHHH#.#B#....',
-      '......#HRRRRRRH#.#B#....',
-      '.......#RRRRRR#..#B#....',
-      '.....############B#.....',
-      '....#CCcCCCCCCcCC#B#....',
-      '...#CCcCRRRRRRCcCC#.....',
-      '..#MM#cCCCCCCCCc#S#.....',
-      '..#m#.#cCCcCCcC#.#......',
-      '......#cC#CCCC#c#.......',
-      '.......#.#BBBB#.........',
-      '.........#BB#BB#........',
-      '........#bb#.#bb#.......',
-      '........###...###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '........######..###.....',
-      '.......#HHHHHH##MMm#....',
-      '......#HHLLLLHH#MmM#....',
-      '......#HHESEHHH##B#.....',
-      '......#HRRRRRRH##B#.....',
-      '.......#RRRRRR#.#B#.....',
-      '.....############B#.....',
-      '....#CCcCCCCCCcCC#......',
-      '...#CCcCRRRRRRCcCC#.....',
-      '...#MM#CCCCCCCCc#S#.....',
-      '...#m##cCCcCCcC#........',
-      '......#cC#CCCC#c#.......',
-      '.......#.#BBBB#.........',
-      '........#BB#.#BB#.......',
-      '.......#bb#...#bb#......',
-      '.......###.....###......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (role === 'poacher') {
-    // Woodland Ambush Poacher with Deep Cowl Hood, Mask & Hunting Bow
-    const grid0: PixelGrid = [
-      '........................',
-      '........######....##....',
-      '.......#HHHHHH#..#WW#...',
-      '......#HCCCCCC#...#WW#..',
-      '......#HHESEHH#....#WW#.',
-      '....#B#HRRRRRH#....#MWW#',
-      '....#m##RRRRR#.....#WW#.',
-      '.....#B#########...#WW#.',
-      '.....#CCcCCCCcCC#.#WW#..',
-      '....#CCcCRRRRCcCC##WW#..',
-      '....#cCCcCCCCcCCc#.#....',
-      '.....#S#cCCCCc#S#.......',
-      '......##.#cc#.###.......',
-      '........#BBBBBB#........',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '........######.....##...',
-      '.......#HHHHHH#...#WW#..',
-      '......#HCCCCCC#....#WW#.',
-      '......#HHESEHH#....#MWW#',
-      '....#B#HRRRRRH#.....#WW#',
-      '....#m##RRRRR#.....#WW#.',
-      '.....#B#########..#WW#..',
-      '.....#CCcCCCCcCC#.#WW#..',
-      '....#CCcCRRRRCcCC##W#...',
-      '....#cCCcCCCCcCCc#......',
-      '.....#S#cCCCCc#S#.......',
-      '......##.#cc#.###.......',
-      '........#BBBBBB#........',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (role === 'brigand') {
-    // Masked Road Brigand with Rusted Fur Cap, Cracked Wooden Buckler & Jagged Spear
-    const grid0: PixelGrid = [
-      '...................##...',
-      '..................#Mm#..',
-      '........######...#MM#...',
-      '.......#mHHHHm#.#B#.....',
-      '......#LLHHHHLL#B#......',
-      '.......#HESEHH#B#.......',
-      '.......#RRRRR#B#........',
-      '......###CCCC#B#........',
-      '.....#WWWCCCC#B#........',
-      '....#WWmWCRRC#B#........',
-      '....#WWmWcCCC#B#........',
-      '.....#WWW#B#c#B#........',
-      '......###B###c#.........',
-      '........#B#B#.#B#.......',
-      '.......#B##B#.#B#.......',
-      '..........#bb#bb#.......',
-      '..........###.###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '..................##....',
-      '.................#Mm#...',
-      '........######..#MM#....',
-      '.......#mHHHHm##B#......',
-      '......#LLHHHHLLB#.......',
-      '.......#HESEHH#B#.......',
-      '.......#RRRRR#B#........',
-      '......###CCCC#B#........',
-      '.....#WWWCCCC#B#........',
-      '....#WWmWCRRC#B#........',
-      '....#WWmWcCCC#B#........',
-      '.....#WWW#B#c#B#........',
-      '......###B###c#.........',
-      '........#B#B###B#.......',
-      '.......#B##B#..#B#......',
-      '.........#bb#...#bb#....',
-      '.........###.....###....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 5);
-  } else if (role === 'raider_horse') {
-    // Masked Highway Raider on Lean Unbarded Dark Horse with Curved Scimitar
-    const grid0: PixelGrid = [
-      '..................###...',
-      '........#####....#MM#...',
-      '.......#HHHHH#...#Mm#...',
-      '.......#HESEH#..#M#.....',
-      '.......#RRRRR#..#B#.....',
-      '......##CCCCC##.#B#.....',
-      '.....#CCcRRRcCC##B#.##..',
-      '.....#cCCCCCCCC#B##bbB#.',
-      '....##cCCCCCCCC#B#bBBBb#',
-      '...#bBBBBBBBBBBBBBBBB#..',
-      '..#bBBbBBBBBBBBBBBbBB#..',
-      '..#b#bBRRRRRRRRRRBb#B#..',
-      '..#.#bBBBBBBBBBBBBb#B#..',
-      '.....#BB#......#BB#.....',
-      '....#bb#........#bb#....',
-      '....###..........###....',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '.................###....',
-      '........#####...#MM#....',
-      '.......#HHHHH#..#Mm#....',
-      '.......#HESEH#.#M#......',
-      '.......#RRRRR#.#B#......',
-      '......##CCCCC###B#......',
-      '.....#CCcRRRcCC#B#..##..',
-      '.....#cCCCCCCCC#B##bbB#.',
-      '....##cCCCCCCCC#B#bBBBb#',
-      '...#bBBBBBBBBBBBBBBBB#..',
-      '..#bBBbBBBBBBBBBBBbBB#..',
-      '..#b#bBRRRRRRRRRRBb#B#..',
-      '..#.#bBBBBBBBBBBBBb#B#..',
-      '......#BB#....#BB#......',
-      '.....#bb#......#bb#.....',
-      '.....###........###.....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  } else {
-    // Nimble Bandit Looter / Smuggler in Ragged Hood with Curved Dagger & Loot Pack
-    const grid0: PixelGrid = [
-      '........................',
-      '.........#####..........',
-      '........#HHHHH#.........',
-      '.......#HESEHH#.........',
-      '.......#HRRRRH#.........',
-      '....###.#RRRR#....##....',
-      '...#KKK#########.#MM#...',
-      '..#KKGKK#CCCCCC##m#.....',
-      '..#KKKKK#CRRRRC#S#......',
-      '..#KKK#cCCCCCCCC#.......',
-      '...###.#cCCcCCc#........',
-      '.......#BBBBBBB#........',
-      '........#BB#BB#.........',
-      '.......#bb#.#bb#........',
-      '.......###...###........',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '.........#####..........',
-      '........#HHHHH#.........',
-      '.......#HESEHH#...##....',
-      '.......#HRRRRH#..#MM#...',
-      '....###.#RRRR#...#m#....',
-      '...#KKK##########S#.....',
-      '..#KKGKK#CCCCCC#.#......',
-      '..#KKKKK#CRRRRC#........',
-      '..#KKK#cCCCCCCCC#.......',
-      '...###.#cCCcCCc#........',
-      '.......#BBBBBBB#........',
-      '.......#BB#.#BB#........',
-      '......#bb#...#bb#.......',
-      '......###.....###.......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  }
-
-  // Stamp a plump golden-brown stolen loot sack onto any bandit currently carrying stolen resources!
-  if (carryingLoot && role !== 'looter') {
-    const sx = role === 'raider_horse' ? 3 : 2;
-    const sy = role === 'raider_horse' ? 11 : 10;
-    ctx.fillStyle = '#09090b';
-    ctx.fillRect(sx - 1, sy, 6, 6);
-    ctx.fillStyle = '#a16207';
-    ctx.fillRect(sx, sy + 1, 4, 4);
-    ctx.fillStyle = '#ca8a04';
-    ctx.fillRect(sx + 1, sy + 1, 2, 3);
-    ctx.fillStyle = '#fde047';
-    ctx.fillRect(sx + 1, sy + 1, 2, 1);
-    ctx.fillRect(sx + 2, sy + 2, 1, 1);
-  } else if (carryingLoot && role === 'looter') {
-    // Extra gold overflow glint on looter's big backpack
-    ctx.fillStyle = '#fde047';
-    ctx.fillRect(4, 12, 2, 2);
-    ctx.fillRect(3, 13, 1, 1);
-  }
-
-  return finalizePixelTexture(canvas);
-}
-
 export function getBanditSpriteMaterials(
   role: BanditRoleKind,
   archetype: BanditCampArchetype,
@@ -880,8 +160,12 @@ export function getBanditSpriteMaterials(
   const key = `bandit_${role}_${archetype}_${carryingLoot ? 'loot' : 'clean'}`;
   let cached = UNIT_SPRITE_MATERIAL_CACHE.get(key);
   if (!cached) {
-    const tex0 = createBanditPixelTexture(role, archetype, 0, carryingLoot);
-    const tex1 = createBanditPixelTexture(role, archetype, 1, carryingLoot);
+    const tex0 = finalizePixelTexture(
+      createHighCraftBanditCanvas(role, archetype, 0, carryingLoot)
+    );
+    const tex1 = finalizePixelTexture(
+      createHighCraftBanditCanvas(role, archetype, 1, carryingLoot)
+    );
     cached = {
       frame0: new THREE.MeshBasicMaterial({
         map: tex0,
@@ -916,7 +200,7 @@ export function getBanditSpriteMaterials(
 }
 
 const SHADOW_OVAL_GEOM = (() => {
-  const g = new THREE.CircleGeometry(0.75, 10);
+  const g = new THREE.CircleGeometry(0.48, 12);
   g.rotateX(-Math.PI / 2);
   return g;
 })();
@@ -924,12 +208,12 @@ const SHADOW_OVAL_GEOM = (() => {
 const SHADOW_OVAL_MAT = new THREE.MeshBasicMaterial({
   color: 0x090d16,
   transparent: true,
-  opacity: 0.42,
+  opacity: 0.44,
   depthWrite: false,
 });
 
 const COMMANDER_AURA_RING_GEOM = (() => {
-  const g = new THREE.RingGeometry(1.4, 1.85, 24);
+  const g = new THREE.RingGeometry(0.92, 1.18, 28);
   g.rotateX(-Math.PI / 2);
   return g;
 })();
@@ -1043,11 +327,20 @@ export function build2DPixelUnitSprite(
       )
     : getUnitSpriteMaterials(kind, factionColor, secondaryColor, bannerPattern);
 
-  // Soft pixel shadow oval on the ground
+  // Soft pixel shadow oval on the ground (scaled proportionally to unit footprint)
   const shadow = new THREE.Mesh(SHADOW_OVAL_GEOM, SHADOW_OVAL_MAT);
   shadow.position.y = 0.05;
+  const isMountedUnit =
+    kind === 'knight' || kind === 'commander' || banditVisual?.role === 'raider_horse';
+  const isSiegeUnit = kind === 'battering_ram' || kind === 'trebuchet';
+  if (isSiegeUnit) {
+    shadow.scale.set(2.1, 1, 2.1);
+  } else if (isMountedUnit) {
+    shadow.scale.set(1.45, 1, 1.25);
+  } else {
+    shadow.scale.set(0.9, 1, 0.9);
+  }
   if (kind === 'commander' && !banditVisual) {
-    shadow.scale.set(1.45, 1.45, 1.45);
     const auraRing = new THREE.Mesh(COMMANDER_AURA_RING_GEOM, COMMANDER_AURA_MAT);
     auraRing.position.y = 0.08;
     auraRing.name = 'commanderAuraRing';
@@ -1057,27 +350,27 @@ export function build2DPixelUnitSprite(
 
   // Naval transport galley hull (visible when crossing deep ocean water)
   const boatMat = getNavalBoatSpriteMaterial(factionColor, secondaryColor);
-  const boatMesh = new THREE.Mesh(getSharedBillboardGeometry(4.2, 3.15), boatMat);
+  const boatMesh = new THREE.Mesh(getSharedBillboardGeometry(3.4, 2.55), boatMat);
   boatMesh.name = 'unitNavalBoat';
-  boatMesh.position.y = -0.15;
+  boatMesh.position.y = -0.12;
   boatMesh.visible = false;
   group.add(boatMesh);
 
-  // 2D Pixel Billboard Quad
-  const size = banditVisual
+  // 2D High-Craft Pixel Billboard Quad (authentic anatomical width x height vs buildings)
+  const [quadW, quadH]: [number, number] = banditVisual
     ? banditVisual.role === 'raider_horse'
-      ? 2.72
-      : 2.28
+      ? [1.82, 1.96]
+      : [1.14, 1.52]
     : kind === 'trebuchet'
-      ? 4.25
+      ? [3.05, 3.05]
       : kind === 'battering_ram'
-        ? 3.75
+        ? [2.55, 2.25]
         : kind === 'commander'
-          ? 3.45
+          ? [2.02, 2.20]
           : kind === 'knight'
-            ? 2.85
-            : 2.35;
-  const spriteMesh = new THREE.Mesh(getSharedBillboardGeometry(size, size), mats.frame0);
+            ? [1.84, 1.98]
+            : [1.18, 1.58];
+  const spriteMesh = new THREE.Mesh(getSharedBillboardGeometry(quadW, quadH), mats.frame0);
   spriteMesh.name = 'unitSpriteQuad';
   spriteMesh.castShadow = false;
   group.add(spriteMesh);
