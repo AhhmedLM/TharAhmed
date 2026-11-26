@@ -1,0 +1,364 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body {
+    height: 100dvh;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    font-family: 'Cairo', system-ui, -apple-system, sans-serif;
+    background-color: #0c0906;
+    color: #f3e5c8;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .font-chronicle {
+    font-family: 'Amiri', 'Cairo', Georgia, serif;
+  }
+}
+
+/* ============================================================================
+   AUTHENTIC 2000s MEDIEVAL RTS DESIGN SYSTEM (Stronghold / Age of Empires II)
+   Strictly 4 Natural Materials:
+   1. Carved Ashlar Sandstone (#34281d -> #18110b)
+   2. Dark Polished Oak & Iron (#3b2a1a -> #150e07)
+   3. Burnished Brass & Aged Gold (#ffebb0, #d4a656, #8c621f)
+   4. Aged Vellum Parchment & Sepia Ink (#ecdab4, #241609)
+   ============================================================================ */
+
+/* Primary Carved Ashlar Stone & Iron HUD Frame */
+.rts2k-stone-frame,
+.rts-2000s-panel {
+  background:
+    repeating-linear-gradient(
+      90deg,
+      rgba(255, 224, 160, 0.022) 0px,
+      rgba(255, 224, 160, 0.022) 1px,
+      transparent 1px,
+      transparent 20px
+    ),
+    repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0.22) 0px,
+      rgba(0, 0, 0, 0.22) 1px,
+      transparent 1px,
+      transparent 14px
+    ),
+    linear-gradient(180deg, #35291e 0%, #241b13 48%, #150f0a 100%);
+  border-top: 2px solid #c49a52;
+  border-left: 2px solid #9e783b;
+  border-right: 2px solid #3d2c15;
+  border-bottom: 2px solid #1a1107;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 238, 194, 0.35),
+    inset 0 0 0 1px rgba(18, 12, 6, 0.88),
+    0 4px 14px rgba(0, 0, 0, 0.88);
+}
+
+/* Horizontal Top/Bottom Carved Oak & Hammered Brass Command Console */
+.rts2k-oak-bar,
+.rts-2000s-bar {
+  background:
+    repeating-linear-gradient(
+      90deg,
+      rgba(0, 0, 0, 0.16) 0px,
+      rgba(0, 0, 0, 0.16) 2px,
+      rgba(255, 214, 140, 0.025) 2px,
+      rgba(255, 214, 140, 0.025) 7px
+    ),
+    linear-gradient(180deg, #3b2b1b 0%, #261b10 50%, #160f08 100%);
+  border-top: 2px solid #d4a656;
+  border-bottom: 2px solid #181006;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 243, 207, 0.42),
+    inset 0 -2px 3px rgba(0, 0, 0, 0.85),
+    0 3px 10px rgba(0, 0, 0, 0.9);
+}
+
+/* Aged Medieval Vellum Parchment Scroll (for Dossiers, Tooltips & Chronicles) */
+.rts2k-parchment {
+  background:
+    radial-gradient(circle at 20% 20%, rgba(255, 250, 232, 0.58), transparent 55%),
+    radial-gradient(circle at 85% 80%, rgba(156, 108, 46, 0.28), transparent 60%),
+    linear-gradient(180deg, #eedcb6 0%, #e2c896 55%, #d1b074 100%);
+  color: #241609;
+  border-top: 2px solid #fff3d6;
+  border-left: 2px solid #f2dfb7;
+  border-right: 2px solid #7d5929;
+  border-bottom: 2px solid #593d18;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 0 14px rgba(102, 68, 26, 0.28),
+    0 2px 5px rgba(0, 0, 0, 0.65);
+}
+
+/* Deeply Recessed Ink & Obsidian Well (for Counters, Minimap & Gauges) */
+.rts2k-ink-well,
+.rts-2000s-well {
+  background: linear-gradient(180deg, #0d0905 0%, #18120b 100%);
+  border-top: 1.5px solid #160f06;
+  border-left: 1.5px solid #21160a;
+  border-right: 1.5px solid #7c5c2c;
+  border-bottom: 1.5px solid #967137;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 2px 5px rgba(0, 0, 0, 0.95),
+    0 1px 0 rgba(255, 224, 158, 0.14);
+}
+
+/* Classic 2000s Tactile Chiseled Stone/Oak Pushbutton */
+.rts2k-bevel-btn,
+.rts-2000s-btn {
+  background: linear-gradient(180deg, #4f3b25 0%, #362717 52%, #23180d 100%);
+  color: #f3e5c8;
+  border-top: 2px solid #c89e51;
+  border-left: 2px solid #a37c37;
+  border-right: 2px solid #281b0c;
+  border-bottom: 2px solid #170e05;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 241, 204, 0.28),
+    0 2px 3px rgba(0, 0, 0, 0.82);
+  transition: filter 80ms ease, transform 60ms ease;
+}
+
+.rts2k-bevel-btn:hover:not(:disabled),
+.rts-2000s-btn:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+
+.rts2k-bevel-btn:active:not(:disabled),
+.rts-2000s-btn:active:not(:disabled) {
+  transform: translateY(1px);
+  border-top: 2px solid #1f1409;
+  border-left: 2px solid #2b1d0d;
+  border-right: 2px solid #a37c37;
+  border-bottom: 2px solid #c89e51;
+}
+
+/* Burnished Gold Active / Primary Action Bevel Button */
+.rts2k-bevel-btn-gold,
+.rts-2000s-btn-gold,
+.rts-2000s-btn-active {
+  background: linear-gradient(180deg, #d8a144 0%, #aa741e 55%, #7c4f0c 100%);
+  color: #190f04;
+  border-top: 2px solid #ffebb0;
+  border-left: 2px solid #ecc468;
+  border-right: 2px solid #593807;
+  border-bottom: 2px solid #362103;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 252, 232, 0.65),
+    0 2px 4px rgba(0, 0, 0, 0.85);
+  transition: filter 80ms ease, transform 60ms ease;
+}
+
+.rts2k-bevel-btn-gold:hover:not(:disabled),
+.rts-2000s-btn-gold:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.rts2k-bevel-btn-gold:active:not(:disabled),
+.rts-2000s-btn-gold:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/* Aged Bronze / Olive Patina Confirm Bevel Button (replaces modern bright emerald) */
+.rts2k-bevel-btn-emerald,
+.rts-2000s-btn-emerald {
+  background: linear-gradient(180deg, #4b6033 0%, #354622 55%, #222e14 100%);
+  color: #f4ebd0;
+  border-top: 2px solid #a3b87c;
+  border-left: 2px solid #82965c;
+  border-right: 2px solid #19220e;
+  border-bottom: 2px solid #101708;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 1px 0 rgba(226, 238, 195, 0.35),
+    0 2px 4px rgba(0, 0, 0, 0.85);
+  transition: filter 80ms ease, transform 60ms ease;
+}
+
+.rts2k-bevel-btn-emerald:hover:not(:disabled),
+.rts-2000s-btn-emerald:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+/* Sealing Wax Crimson Close / Cancel Bevel Button */
+.rts2k-bevel-btn-crimson,
+.rts-2000s-btn-crimson {
+  background: linear-gradient(180deg, #872b24 0%, #5e1a15 55%, #3d0e0b 100%);
+  color: #f7e6df;
+  border-top: 2px solid #d47a70;
+  border-left: 2px solid #b5594f;
+  border-right: 2px solid #2b0806;
+  border-bottom: 2px solid #1a0403;
+  border-radius: 1px;
+  box-shadow:
+    inset 0 1px 0 rgba(245, 194, 188, 0.32),
+    0 2px 4px rgba(0, 0, 0, 0.85);
+  transition: filter 80ms ease, transform 60ms ease;
+}
+
+.rts2k-bevel-btn-crimson:hover:not(:disabled),
+.rts-2000s-btn-crimson:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+
+/* Segmented 2000s Pixel-Block Health / Progress Bar Overlay */
+.rts2k-segmented-bar {
+  background-image: repeating-linear-gradient(
+    90deg,
+    transparent 0px,
+    transparent 4px,
+    rgba(0, 0, 0, 0.58) 4px,
+    rgba(0, 0, 0, 0.58) 5px
+  );
+}
+
+/* Physical Carved Stone & Brass File Tab Sticking Up from Command Deck */
+.rts2k-file-tab {
+  background: linear-gradient(180deg, #3e2e1d 0%, #24190e 100%);
+  color: #d6c3a5;
+  border-top: 2px solid #a8803c;
+  border-left: 2px solid #8a662b;
+  border-right: 2px solid #2b1d0d;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  box-shadow: 0 -2px 5px rgba(0, 0, 0, 0.65);
+}
+
+.rts2k-file-tab-active {
+  background: linear-gradient(180deg, #d1993c 0%, #946316 100%);
+  color: #190f04;
+  border-top: 2px solid #ffebb0;
+  border-left: 2px solid #e3b95f;
+  border-right: 2px solid #593807;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  box-shadow: 0 -2px 6px rgba(0, 0, 0, 0.8);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.rts2k-bevel-btn,
+.rts2k-bevel-btn-gold,
+.rts2k-bevel-btn-emerald,
+.rts2k-bevel-btn-crimson,
+.rts2k-file-tab,
+.rts2k-file-tab-active {
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Responsive HUD sizing for Mobile Portrait & Short Landscape Screens */
+.rts2k-hud-top {
+  min-height: 32px;
+}
+
+.rts2k-hud-footer {
+  height: 108px;
+}
+
+@media (min-width: 640px) {
+  .rts2k-hud-footer {
+    height: 114px;
+  }
+}
+
+@media (min-width: 1024px) {
+  .rts2k-hud-footer {
+    height: 122px;
+  }
+}
+
+.rts2k-hud-minimap {
+  height: 122px;
+}
+
+/* Landscape mobile phones (wide viewport >= 640px, short height <= 540px) */
+@media (max-height: 540px) {
+  .rts2k-hud-top {
+    height: 30px;
+    min-height: 30px;
+    padding-top: 1px;
+    padding-bottom: 1px;
+  }
+
+  .rts2k-hud-compass {
+    display: none !important;
+  }
+
+  .rts2k-hud-footer {
+    height: 82px !important;
+    left: 0 !important;
+    padding-top: 3px !important;
+    padding-bottom: 3px !important;
+  }
+
+  .rts2k-desktop-minimap {
+    display: none !important;
+  }
+
+  .rts2k-mobile-radar-btn {
+    display: flex !important;
+  }
+
+  .rts2k-hud-tile {
+    width: 60px !important;
+    height: 70px !important;
+    padding: 2px !important;
+  }
+
+  .rts2k-hud-tile-art {
+    width: 40px !important;
+    height: 34px !important;
+  }
+
+  .rts2k-hud-soldier-tile {
+    width: 56px !important;
+    height: 56px !important;
+    padding: 2px !important;
+  }
+
+  .rts2k-hud-soldier-art {
+    width: 28px !important;
+    height: 28px !important;
+    margin-top: 1px !important;
+  }
+
+  .rts2k-hud-parchment {
+    width: 260px !important;
+    padding: 3px 10px !important;
+  }
+
+  .rts2k-compact-hide {
+    display: none !important;
+  }
+}
+
+.rts2k-hud-footer[data-collapsed='true'] {
+  height: 4px !important;
+  padding: 0 !important;
+  overflow: visible !important;
+}
+
+

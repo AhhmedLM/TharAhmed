@@ -1,0 +1,6 @@
+{
+  "name": "Husun: Medieval RTS Multiplayer Blockout",
+  "description": "Real-time multiplayer medieval strategy game foundation featuring a WebSocket authoritative server, packet synchronization pipeline, and 3D top-down strategic camera blockout.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

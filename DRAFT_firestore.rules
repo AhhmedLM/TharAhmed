@@ -1,0 +1,329 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net: Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // Hardened Global Primitives
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isHexColor(val) {
+      return val is string && val.size() >= 4 && val.size() <= 16 && val.matches('^#[0-9a-fA-F]{3,8}$');
+    }
+
+    function isCoordInBounds(val) {
+      return val is number && val >= -200 && val <= 200;
+    }
+
+    function commanderExists(uid) {
+      return exists(/databases/$(database)/documents/commanders/$(uid));
+    }
+
+    // =========================================================================
+    // Validation Blueprints (Anti-Update-Gap)
+    // =========================================================================
+    function isValidCommanderProfile(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'displayName',
+          'factionName',
+          'color',
+          'wood',
+          'stone',
+          'gold',
+          'food',
+          'cameraX',
+          'cameraZ',
+          'cameraZoom',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'displayName',
+          'factionName',
+          'color',
+          'wood',
+          'stone',
+          'gold',
+          'food',
+          'cameraX',
+          'cameraZ',
+          'cameraZoom',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId == request.auth.uid
+        && isValidId(data.ownerId)
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 40
+        && data.factionName is string && data.factionName.size() >= 1 && data.factionName.size() <= 60
+        && isHexColor(data.color)
+        && data.wood is number && data.wood >= 0 && data.wood <= 1000000
+        && data.stone is number && data.stone >= 0 && data.stone <= 1000000
+        && data.gold is number && data.gold >= 0 && data.gold <= 1000000
+        && data.food is number && data.food >= 0 && data.food <= 1000000
+        && isCoordInBounds(data.cameraX)
+        && isCoordInBounds(data.cameraZ)
+        && data.cameraZoom is number && data.cameraZoom >= 10 && data.cameraZoom <= 100
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCloudStructure(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'ownerColor',
+          'kind',
+          'level',
+          'x',
+          'z',
+          'rotationY',
+          'hp',
+          'maxHp',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'ownerColor',
+          'kind',
+          'level',
+          'x',
+          'z',
+          'rotationY',
+          'hp',
+          'maxHp',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId == request.auth.uid
+        && isValidId(data.ownerId)
+        && isHexColor(data.ownerColor)
+        && data.kind is string && data.kind.size() >= 4 && data.kind.size() <= 24
+        && (
+          data.kind == 'keep' ||
+          data.kind == 'barracks' ||
+          data.kind == 'lumber_camp' ||
+          data.kind == 'quarry' ||
+          data.kind == 'watchtower'
+        )
+        && data.level is number && (data.level == 1 || data.level == 2 || data.level == 3)
+        && isCoordInBounds(data.x)
+        && isCoordInBounds(data.z)
+        && data.rotationY is number && data.rotationY >= -10 && data.rotationY <= 10
+        && data.hp is number && data.hp >= 0 && data.hp <= 10000
+        && data.maxHp is number && data.maxHp >= 100 && data.maxHp <= 10000
+        && data.hp <= data.maxHp
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCloudUnit(data) {
+      return data.keys().hasAll([
+          'ownerId',
+          'ownerColor',
+          'kind',
+          'x',
+          'z',
+          'targetX',
+          'targetZ',
+          'rotationY',
+          'speed',
+          'state',
+          'hp',
+          'maxHp',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'ownerColor',
+          'kind',
+          'x',
+          'z',
+          'targetX',
+          'targetZ',
+          'rotationY',
+          'speed',
+          'state',
+          'hp',
+          'maxHp',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.ownerId == request.auth.uid
+        && isValidId(data.ownerId)
+        && isHexColor(data.ownerColor)
+        && data.kind is string && data.kind.size() >= 6 && data.kind.size() <= 16
+        && (data.kind == 'worker' || data.kind == 'infantry' || data.kind == 'knight')
+        && isCoordInBounds(data.x)
+        && isCoordInBounds(data.z)
+        && isCoordInBounds(data.targetX)
+        && isCoordInBounds(data.targetZ)
+        && data.rotationY is number && data.rotationY >= -10 && data.rotationY <= 10
+        && data.speed is number && data.speed >= 1 && data.speed <= 30
+        && data.state is string && data.state.size() >= 4 && data.state.size() <= 16
+        && (data.state == 'idle' || data.state == 'moving' || data.state == 'gathering')
+        && data.hp is number && data.hp >= 0 && data.hp <= 2000
+        && data.maxHp is number && data.maxHp >= 20 && data.maxHp <= 2000
+        && data.hp <= data.maxHp
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // Collection 1: /commanders/{commanderId}
+    // =========================================================================
+    match /commanders/{commanderId} {
+      allow get: if isSignedIn() && isValidId(commanderId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(commanderId)
+        && commanderId == request.auth.uid
+        && isValidCommanderProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(commanderId)
+        && commanderId == request.auth.uid
+        && existing().ownerId == request.auth.uid
+        && isValidCommanderProfile(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Resource & Camera Sync
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'wood',
+            'stone',
+            'gold',
+            'food',
+            'cameraX',
+            'cameraZ',
+            'cameraZoom',
+            'updatedAt'
+          ]) ||
+          // Action 2: Profile Title Update
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'factionName',
+            'color',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(commanderId)
+        && commanderId == request.auth.uid
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // =========================================================================
+    // Collection 2: /structures/{structureId}
+    // =========================================================================
+    match /structures/{structureId} {
+      allow get: if isSignedIn() && isValidId(structureId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(structureId)
+        && isValidCloudStructure(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && commanderExists(request.auth.uid);
+
+      allow update: if isVerifiedUser()
+        && isValidId(structureId)
+        && existing().ownerId == request.auth.uid
+        && isValidCloudStructure(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().kind == existing().kind
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && commanderExists(request.auth.uid)
+        && (
+          // Action: Upgrade Building Evolution Tier (Level 1 -> 2 -> 3)
+          (
+            incoming().level == existing().level + 1
+            && incoming().diff(existing()).affectedKeys().hasOnly(['level', 'hp', 'maxHp', 'updatedAt'])
+          ) ||
+          // Action: Repair / Sync HP
+          (
+            incoming().level == existing().level
+            && incoming().diff(existing()).affectedKeys().hasOnly(['hp', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(structureId)
+        && existing().ownerId == request.auth.uid;
+    }
+
+    // =========================================================================
+    // Collection 3: /units/{unitId}
+    // =========================================================================
+    match /units/{unitId} {
+      allow get: if isSignedIn() && isValidId(unitId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(unitId)
+        && isValidCloudUnit(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && commanderExists(request.auth.uid);
+
+      allow update: if isVerifiedUser()
+        && isValidId(unitId)
+        && existing().ownerId == request.auth.uid
+        && isValidCloudUnit(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().kind == existing().kind
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && commanderExists(request.auth.uid)
+        && (
+          // Action: Issue Tactical Move / Gather Order
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'x',
+            'z',
+            'targetX',
+            'targetZ',
+            'rotationY',
+            'state',
+            'hp',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(unitId)
+        && existing().ownerId == request.auth.uid;
+    }
+  }
+}
