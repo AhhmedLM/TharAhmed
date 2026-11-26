@@ -4,27 +4,20 @@ import { auth, googleProvider } from './firebaseClient';
 import {
   normalizeCultureKind,
   type BannerPatternKind,
-  type BlockoutStructure,
-  type BlockoutUnit,
   type CultureKind,
-  type PlayerResources,
-  type PlayerState,
   type StructureKind,
   type UnitKind,
   type WorldState,
 } from '../shared/protocol';
 
 interface HydrateCloudPayload {
+  idToken?: string;
   displayName: string;
   factionName?: string;
   primaryColor?: string;
   secondaryColor?: string;
   bannerPattern?: BannerPatternKind;
   culture?: CultureKind;
-  resources: PlayerResources;
-  structures: BlockoutStructure[];
-  units: BlockoutUnit[];
-  camera?: PlayerState['camera'];
 }
 
 interface UseCloudSyncOptions {
@@ -33,7 +26,7 @@ interface UseCloudSyncOptions {
   onHydrateServerFromCloud: (payload: HydrateCloudPayload) => void;
 }
 
-const LOCAL_BACKUP_KEY = 'husun_rts_local_kingdom_backup_v2';
+const LOCAL_BACKUP_KEY = 'thar_ahmed_local_kingdom_v1';
 
 export function useCloudSync({
   playerId,
@@ -150,10 +143,6 @@ export function useCloudSync({
             secondaryColor: me.secondaryColor ?? '#fbbf24',
             bannerPattern: me.bannerPattern ?? 'crescent_star',
             culture: normalizeCultureKind(me.culture),
-            resources: me.resources,
-            structures: myStructures,
-            units: myUnits,
-            camera: me.camera,
           }),
         });
 
@@ -224,7 +213,11 @@ export function useCloudSync({
         }
 
         const data = (await res.json()) as {
-          kingdom: (HydrateCloudPayload & { updatedAt?: string }) | null;
+          kingdom: (HydrateCloudPayload & {
+            structures?: unknown[];
+            units?: unknown[];
+            updatedAt?: string;
+          }) | null;
         };
 
         if (isCancelled) return;
@@ -244,23 +237,13 @@ export function useCloudSync({
         hydratedUidRef.current = uid;
 
         onHydrateServerFromCloud({
+          idToken: token,
           displayName: String(k.displayName || user?.displayName || 'قائد الحصن'),
           factionName: k.factionName,
           primaryColor: k.primaryColor,
           secondaryColor: k.secondaryColor,
           bannerPattern: k.bannerPattern,
           culture: k.culture,
-          resources: {
-            wood: Number(k.resources?.wood ?? 750),
-            stone: Number(k.resources?.stone ?? 650),
-            gold: Number(k.resources?.gold ?? 500),
-            food: Number(k.resources?.food ?? 550),
-            cloth: Number(k.resources?.cloth ?? 380),
-            horses: Number(k.resources?.horses ?? 260),
-          },
-          structures: loadedStructures,
-          units: loadedUnits,
-          camera: k.camera,
         });
 
         setLastSyncedAt(new Date().toLocaleTimeString('ar-EG'));

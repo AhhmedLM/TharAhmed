@@ -4,7 +4,6 @@ import {
   BanditCampArchetype,
   BanditRoleKind,
   BannerPatternKind,
-  CitizenRoleKind,
   ResourceKind,
   UnitKind,
 } from '../shared/protocol';
@@ -74,6 +73,28 @@ export function getSharedBillboardGeometry(width: number, height: number): THREE
 // ============================================================================
 // 1. 2D PIXEL-ART UNIT SPRITES (2-FRAME ANIMATED: WORKER, INFANTRY, CAVALRY)
 // ============================================================================
+
+const MAX_MATERIAL_CACHE_ENTRIES = 120;
+
+function setBoundedCacheEntry<K, V>(
+  cache: Map<K, V>,
+  key: K,
+  value: V,
+  maxSize: number,
+  onEvict: (old: V) => void
+): void {
+  if (cache.has(key)) {
+    cache.delete(key);
+  } else if (cache.size >= maxSize) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      const oldestVal = cache.get(oldestKey);
+      cache.delete(oldestKey);
+      if (oldestVal !== undefined) onEvict(oldestVal);
+    }
+  }
+  cache.set(key, value);
+}
 
 const UNIT_SPRITE_MATERIAL_CACHE = new Map<
   string,
@@ -561,6 +582,20 @@ export function getUnitSpriteMaterials(
         side: THREE.DoubleSide,
       }),
     };
+    setBoundedCacheEntry(
+      UNIT_SPRITE_MATERIAL_CACHE,
+      key,
+      cached,
+      MAX_MATERIAL_CACHE_ENTRIES,
+      (old) => {
+        old.frame0.map?.dispose();
+        old.frame0.dispose();
+        old.frame1.map?.dispose();
+        old.frame1.dispose();
+      }
+    );
+  } else {
+    UNIT_SPRITE_MATERIAL_CACHE.delete(key);
     UNIT_SPRITE_MATERIAL_CACHE.set(key, cached);
   }
   return cached;
@@ -861,6 +896,20 @@ export function getBanditSpriteMaterials(
         side: THREE.DoubleSide,
       }),
     };
+    setBoundedCacheEntry(
+      UNIT_SPRITE_MATERIAL_CACHE,
+      key,
+      cached,
+      MAX_MATERIAL_CACHE_ENTRIES,
+      (old) => {
+        old.frame0.map?.dispose();
+        old.frame0.dispose();
+        old.frame1.map?.dispose();
+        old.frame1.dispose();
+      }
+    );
+  } else {
+    UNIT_SPRITE_MATERIAL_CACHE.delete(key);
     UNIT_SPRITE_MATERIAL_CACHE.set(key, cached);
   }
   return cached;
@@ -960,7 +1009,16 @@ export function getNavalBoatSpriteMaterial(
       alphaTest: 0.45,
       side: THREE.DoubleSide,
     });
-    NAVAL_BOAT_MAT_CACHE.set(key, mat);
+    setBoundedCacheEntry(
+      NAVAL_BOAT_MAT_CACHE,
+      key,
+      mat,
+      MAX_MATERIAL_CACHE_ENTRIES,
+      (old) => {
+        old.map?.dispose();
+        old.dispose();
+      }
+    );
   }
   return mat;
 }
@@ -1430,7 +1488,17 @@ export function getResourceSpriteMaterial(
       mat = base.clone();
       mat.color.setHex(visState === 'explored' ? 0x64748b : 0x263244);
     }
-    RESOURCE_SPRITE_TINT_CACHE.set(key, mat);
+    setBoundedCacheEntry(
+      RESOURCE_SPRITE_TINT_CACHE,
+      key,
+      mat,
+      MAX_MATERIAL_CACHE_ENTRIES,
+      (old) => {
+        if (!Array.from(RESOURCE_SPRITE_MAT_CACHE.values()).includes(old)) {
+          old.dispose();
+        }
+      }
+    );
   }
   return mat;
 }
@@ -1448,512 +1516,6 @@ export function build2DPixelResourceSprite(kind: ResourceKind): THREE.Group {
   spriteMesh.name = 'resourceSpriteQuad';
   group.add(spriteMesh);
   group.userData = { kind, spriteMesh };
-
-  return group;
-}
-
-// ============================================================================
-// 4. 2D PIXEL-ART LIVING CITIZEN / TOWNSFOLK SPRITES (FARMER, MERCHANT, SCHOLAR, WATER CARRIER)
-// ============================================================================
-
-const CITIZEN_SPRITE_MATERIAL_CACHE = new Map<
-  string,
-  { frame0: THREE.MeshBasicMaterial; frame1: THREE.MeshBasicMaterial }
->();
-
-function createCitizenPixelTexture(
-  role: CitizenRoleKind,
-  factionColor: string,
-  frame: 0 | 1
-): THREE.CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = 24;
-  canvas.height = 24;
-  const ctx = canvas.getContext('2d')!;
-  ctx.clearRect(0, 0, 24, 24);
-
-  const fCol = new THREE.Color(factionColor);
-  const fDark = fCol.clone().multiplyScalar(0.68);
-  const fLight = fCol.clone().lerp(new THREE.Color(0xffffff), 0.35);
-
-  const palette: Record<string, string> = {
-    '#': '#0f172a', // 1px Pixel Outline
-    S: '#f1c27d', // Skin
-    s: '#d2995b', // Skin shadow
-    F: `#${fCol.getHexString()}`, // Faction cloth
-    f: `#${fDark.getHexString()}`, // Faction shadow
-    L: `#${fLight.getHexString()}`, // Faction highlight
-    W: '#fffbeb', // White linen / turban / scroll
-    G: '#facc15', // Golden wheat / gold coin
-    g: '#ca8a04', // Dark gold / grain basket
-    B: '#78350f', // Wood / basket / leather
-    b: '#451a03', // Boots
-    C: '#38bdf8', // Water jug / scholar cyan trim
-    P: '#a855f7', // Merchant silk / spice sack
-    E: '#22c55e', // Fresh crop greens
-  };
-
-  if (role === 'farmer') {
-    // Villager Farmer carrying a golden wheat sheaf & harvest basket + floating grain icon on top
-    const grid0: PixelGrid = [
-      '..........####..........',
-      '.........#GGGG#.........',
-      '.........#gEEg#.........',
-      '..........####..........',
-      '.........######.........',
-      '........#WWWWWW#........',
-      '.......#WWFFFFWW#.......',
-      '.......#sSSSSSSs#..####.',
-      '........#SSSSSS#..#GGGG#',
-      '.......##########.#gGGg#',
-      '......#FFffffffFF##BBBB#',
-      '.....#FFFWWWWWWFFF#BBBB#',
-      '.....#fFFWWWWWWFFf######',
-      '......#S#FFFFFF#Ss#.....',
-      '.......##BBBBBB###......',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-    ];
-    const grid1: PixelGrid = [
-      '..........####..........',
-      '.........#GGGG#.........',
-      '.........#gEEg#.........',
-      '..........####..........',
-      '.........######.........',
-      '........#WWWWWW#...####.',
-      '.......#WWFFFFWW#.#GGGG#',
-      '.......#sSSSSSSs#.#gGGg#',
-      '........#SSSSSS#..#BBBB#',
-      '.......##########.#BBBB#',
-      '......#FFffffffFF#######',
-      '.....#FFFWWWWWWFFF#.....',
-      '.....#fFFWWWWWWFFf#.....',
-      '......#S#FFFFFF#Ss#.....',
-      '.......##BBBBBB###......',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 4);
-  } else if (role === 'merchant') {
-    // Town Merchant with ornate turban/hat carrying spice & gold trade bundle
-    const grid0: PixelGrid = [
-      '..........####..........',
-      '.........#GGGG#.........',
-      '.........#gWWg#.........',
-      '..........####..........',
-      '........########........',
-      '.......#PPPPPPPP#.......',
-      '.......#PGGGGGGP#.......',
-      '.......#sSSSSSSs#..####.',
-      '........#SSSSSS#..#GGGG#',
-      '.......##########.#PPPP#',
-      '......#PPFFFFFFPP##PPPP#',
-      '.....#PPPGGGGGGPPP#####.',
-      '.....#PFFffffffFFP#.....',
-      '......#S#PPPPPP#Ss#.....',
-      '.......##GGGGGG###......',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-    ];
-    const grid1: PixelGrid = [
-      '..........####..........',
-      '.........#GGGG#.........',
-      '.........#gWWg#.........',
-      '..........####..........',
-      '........########...####.',
-      '.......#PPPPPPPP#.#GGGG#',
-      '.......#PGGGGGGP#.#PPPP#',
-      '.......#sSSSSSSs#.#PPPP#',
-      '........#SSSSSS#..#####.',
-      '.......##########.......',
-      '......#PPFFFFFFPP#......',
-      '.....#PPPGGGGGGPPP#.....',
-      '.....#PFFffffffFFP#.....',
-      '......#S#PPPPPP#Ss#.....',
-      '.......##GGGGGG###......',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 4);
-  } else if (role === 'scholar') {
-    // Temple Scholar / Worshipper in flowing cultural robes carrying a lantern & scroll
-    const grid0: PixelGrid = [
-      '..........####..........',
-      '.........#CCCC#.........',
-      '.........#CWWC#.........',
-      '..........####..........',
-      '.........######.........',
-      '........#WWWWWW#........',
-      '.......#WCCCCCCW#.......',
-      '.......#sSSSSSSs#...###.',
-      '........#SSSSSS#...#GGG#',
-      '.......##########..#GWG#',
-      '......#WWFFFFFFWW#.#GGG#',
-      '.....#WWWCCCCCCWWW#.###.',
-      '.....#WFFffffffFFW#..#..',
-      '......#WWWWWWWWWW#......',
-      '......#WWffffffWW#......',
-      '.......#WW####WW#.......',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-    ];
-    const grid1: PixelGrid = [
-      '..........####..........',
-      '.........#CCCC#.........',
-      '.........#CWWC#.........',
-      '..........####......###.',
-      '.........######....#GGG#',
-      '........#WWWWWW#...#GWG#',
-      '.......#WCCCCCCW#..#GGG#',
-      '.......#sSSSSSSs#...###.',
-      '........#SSSSSS#.....#..',
-      '.......##########.......',
-      '......#WWFFFFFFWW#......',
-      '.....#WWWCCCCCCWWW#.....',
-      '.....#WFFffffffFFW#.....',
-      '......#WWWWWWWWWW#......',
-      '......#WWffffffWW#......',
-      '......#WW#....#WW#......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 4);
-  } else if (role === 'shepherd') {
-    // Bedouin / Village Shepherd & Weaver carrying a shepherd's crook and bolt of woven cloth
-    const grid0: PixelGrid = [
-      '..........####..........',
-      '.........#WWWW#.........',
-      '.........#WFFW#.........',
-      '..........####..........',
-      '.........######....###..',
-      '........#WWWWWW#..#BBB#.',
-      '.......#W######W#.#B#B#.',
-      '.......#sSSSSSSs#.#B#...',
-      '........#SSSSSS#..#B#...',
-      '.......##########.#B#...',
-      '......#WWFFFFFFWW##B#...',
-      '.....#WWWGGGGGGWWW#B#...',
-      '.....#WFFffffffFFW#B#...',
-      '......#S#WWWWWW#Ss#B#...',
-      '.......##BBBBBB###.#....',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-    ];
-    const grid1: PixelGrid = [
-      '..........####..........',
-      '.........#WWWW#.........',
-      '.........#WFFW#.........',
-      '..........####.....###..',
-      '.........######...#BBB#.',
-      '........#WWWWWW#..#B#B#.',
-      '.......#W######W#.#B#...',
-      '.......#sSSSSSSs#.#B#...',
-      '........#SSSSSS#..#B#...',
-      '.......##########.#B#...',
-      '......#WWFFFFFFWW##B#...',
-      '.....#WWWGGGGGGWWW#B#...',
-      '.....#WFFffffffFFW#B#...',
-      '......#S#WWWWWW#Ss#.....',
-      '.......##BBBBBB###......',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 4);
-  } else if (role === 'livestock_sheep') {
-    // 2D Pixel-Art Fluffy White Grazing Sheep with Faction Wool Ribbon
-    const grid0: PixelGrid = [
-      '........................',
-      '........................',
-      '........................',
-      '........................',
-      '........................',
-      '......##########........',
-      '....##WWWWWWWWWW##......',
-      '...#WWWWWWFFWWWWWW###...',
-      '..#WWWWWWWWWWWWWW#bbb#..',
-      '..#WWWWWWWWWWWWWW#bSbb#.',
-      '...#WWWWWWWWWWWW##bbb#..',
-      '....############..###...',
-      '.....#bb#....#bb#.......',
-      '.....#bb#....#bb#.......',
-      '.....###......###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '........................',
-      '........................',
-      '........................',
-      '........................',
-      '......##########........',
-      '....##WWWWWWWWWW##......',
-      '...#WWWWWWFFWWWWWW#.....',
-      '..#WWWWWWWWWWWWWW####...',
-      '..#WWWWWWWWWWWWWW#bbb#..',
-      '...#WWWWWWWWWWWW##bSbb#.',
-      '....############..####..',
-      '....#bb#......#bb#......',
-      '....#bb#......#bb#......',
-      '....###........###......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  } else if (role === 'livestock_camel') {
-    // 2D Pixel-Art Arabian Camel with Colorful Sadu Woven Saddle Blanket
-    const grid0: PixelGrid = [
-      '........................',
-      '.................####...',
-      '.......#####....#BBBB#..',
-      '......#BBBBB#...#BSSB#..',
-      '.....#BBFFBBB#..#BB##...',
-      '....#BBFGGFBBB#.#BB#....',
-      '...#BBBFFFFBBBB##BB#....',
-      '..#BBBBBBBBBBBBBBBB#....',
-      '..#BBBBBBBBBBBBBBB#.....',
-      '...###############......',
-      '....#BB#......#BB#......',
-      '....#BB#......#BB#......',
-      '....#bb#......#bb#......',
-      '....###........###......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '.................####...',
-      '.......#####....#BBBB#..',
-      '......#BBBBB#...#BSSB#..',
-      '.....#BBFFBBB#..#BB##...',
-      '....#BBFGGFBBB#.#BB#....',
-      '...#BBBFFFFBBBB##BB#....',
-      '..#BBBBBBBBBBBBBBBB#....',
-      '..#BBBBBBBBBBBBBBB#.....',
-      '...###############......',
-      '.....#BB#....#BB#.......',
-      '....#BB#......#BB#......',
-      '....#bb#......#bb#......',
-      '....###........###......',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  } else if (role === 'horse_trainer') {
-    // Master Horse Trainer & Tamer (السيّاس ومروّض الخيول) carrying golden bridle & taming lasso
-    const grid0: PixelGrid = [
-      '..........####..........',
-      '.........#GGGG#.........',
-      '.........#GBBG#.........',
-      '..........####..........',
-      '.........######....###..',
-      '........#FFFFFF#..#GGG#.',
-      '.......#FGGGGGGF#.#G#G#.',
-      '.......#sSSSSSSs#.#G#...',
-      '........#SSSSSS#..#B#...',
-      '.......##########.#B#...',
-      '......#FFBBBBBBFF##B#...',
-      '.....#FFFGGGGGGFFF#B#...',
-      '.....#fFFBBBBBBFFf#.....',
-      '......#S#FFFFFF#Ss#.....',
-      '.......##BBBBBB###......',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-    ];
-    const grid1: PixelGrid = [
-      '..........####..........',
-      '.........#GGGG#.........',
-      '.........#GBBG#.........',
-      '..........####.....###..',
-      '.........######...#GGG#.',
-      '........#FFFFFF#..#G#G#.',
-      '.......#FGGGGGGF#.#G#...',
-      '.......#sSSSSSSs#.#B#...',
-      '........#SSSSSS#..#B#...',
-      '.......##########.#B#...',
-      '......#FFBBBBBBFF##B#...',
-      '.....#FFFGGGGGGFFF#.....',
-      '.....#fFFBBBBBBFFf#.....',
-      '......#S#FFFFFF#Ss#.....',
-      '.......##BBBBBB###......',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 4);
-  } else if (role === 'wild_horse') {
-    // 2D Pixel-Art Spirited Chestnut Wild Horse trotting/cantering in the taming ring
-    const grid0: PixelGrid = [
-      '........................',
-      '.................####...',
-      '................#bBBb#..',
-      '...............#bBBBBb#.',
-      '..............#bBBSSB#..',
-      '....##########bBBBB##...',
-      '...#bbBBBBBBBBBBBB#.....',
-      '..#bbBBBBBBBBBBBBB#.....',
-      '..#b#BBBBBBBBBBBB#......',
-      '...#.#BB#....#BB#.......',
-      '.....#BB#....#BB#.......',
-      '.....#bb#....#bb#.......',
-      '.....###......###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '.................####...',
-      '................#bBBb#..',
-      '...............#bBBBBb#.',
-      '..............#bBBSSB#..',
-      '....##########bBBBB##...',
-      '...#bbBBBBBBBBBBBB#.....',
-      '..#bbBBBBBBBBBBBBB#.....',
-      '..#b#BBBBBBBBBBBB#......',
-      '....#BB#......#BB#......',
-      '...#BB#........#BB#.....',
-      '...#bb#........#bb#.....',
-      '...###..........###.....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  } else if (role === 'tamed_stallion') {
-    // 2D Pixel-Art Purebred White Arabian Warhorse with Faction Saddle Cloth & Golden Bridle
-    const grid0: PixelGrid = [
-      '........................',
-      '.................####...',
-      '................#WWWW#..',
-      '...............#WWGGWW#.',
-      '..............#WWGWWWW#.',
-      '....##########WWWW##....',
-      '...#WWWWFFFFFFWWWW#.....',
-      '..#WWWWFGGGGGGFWWW#.....',
-      '..#W#WWFFFFFFFFWW#......',
-      '...#.#WW#....#WW#.......',
-      '.....#WW#....#WW#.......',
-      '.....#bb#....#bb#.......',
-      '.....###......###.......',
-      '........................',
-    ];
-    const grid1: PixelGrid = [
-      '........................',
-      '.................####...',
-      '................#WWWW#..',
-      '...............#WWGGWW#.',
-      '..............#WWGWWWW#.',
-      '....##########WWWW##....',
-      '...#WWWWFFFFFFWWWW#.....',
-      '..#WWWWFGGGGGGFWWW#.....',
-      '..#W#WWFFFFFFFFWW#......',
-      '....#WW#......#WW#......',
-      '...#WW#........#WW#.....',
-      '...#bb#........#bb#.....',
-      '...###..........###.....',
-      '........................',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 6);
-  } else {
-    // Neighborhood Water Carrier / Artisan carrying clay water amphorae
-    const grid0: PixelGrid = [
-      '..........####..........',
-      '.........#CCCC#.........',
-      '.........#CLLC#.........',
-      '..........####..........',
-      '.........######.........',
-      '........#FFFFFF#........',
-      '.......#FFLLLLFF#..####.',
-      '.......#sSSSSSSs#.#CCCC#',
-      '........#SSSSSS#..#CWWC#',
-      '.......##########.#CCCC#',
-      '......#FFBBBBBBFF#.####.',
-      '.....#FFFBBBBBBFFF#.....',
-      '.....#fFFBBBBBBFFf#.....',
-      '......#S#FFFFFF#Ss#.....',
-      '.......##BBBBBB###......',
-      '........#BB##BB#........',
-      '.......#bb#..#bb#.......',
-      '.......###....###.......',
-    ];
-    const grid1: PixelGrid = [
-      '..........####..........',
-      '.........#CCCC#.........',
-      '.........#CLLC#....####.',
-      '..........####....#CCCC#',
-      '.........######...#CWWC#',
-      '........#FFFFFF#..#CCCC#',
-      '.......#FFLLLLFF#..####.',
-      '.......#sSSSSSSs#.......',
-      '........#SSSSSS#........',
-      '.......##########.......',
-      '......#FFBBBBBBFF#......',
-      '.....#FFFBBBBBBFFF#.....',
-      '.....#fFFBBBBBBFFf#.....',
-      '......#S#FFFFFF#Ss#.....',
-      '.......##BBBBBB###......',
-      '.......#BB#..#BB#.......',
-      '......#bb#....#bb#......',
-      '......###......###......',
-    ];
-    drawPixelArtGrid(ctx, frame === 0 ? grid0 : grid1, palette, 0, 4);
-  }
-
-  return finalizePixelTexture(canvas);
-}
-
-export function getCitizenSpriteMaterials(
-  role: CitizenRoleKind,
-  factionColor: string
-): { frame0: THREE.MeshBasicMaterial; frame1: THREE.MeshBasicMaterial } {
-  const key = `${role}_${factionColor}`;
-  let cached = CITIZEN_SPRITE_MATERIAL_CACHE.get(key);
-  if (!cached) {
-    const tex0 = createCitizenPixelTexture(role, factionColor, 0);
-    const tex1 = createCitizenPixelTexture(role, factionColor, 1);
-    cached = {
-      frame0: new THREE.MeshBasicMaterial({
-        map: tex0,
-        transparent: true,
-        alphaTest: 0.45,
-        side: THREE.DoubleSide,
-      }),
-      frame1: new THREE.MeshBasicMaterial({
-        map: tex1,
-        transparent: true,
-        alphaTest: 0.45,
-        side: THREE.DoubleSide,
-      }),
-    };
-    CITIZEN_SPRITE_MATERIAL_CACHE.set(key, cached);
-  }
-  return cached;
-}
-
-export function build2DPixelCitizenSprite(
-  role: CitizenRoleKind,
-  factionColor: string
-): THREE.Group {
-  const group = new THREE.Group();
-  const mats = getCitizenSpriteMaterials(role, factionColor);
-
-  const shadow = new THREE.Mesh(SHADOW_OVAL_GEOM, SHADOW_OVAL_MAT);
-  shadow.scale.setScalar(0.78);
-  shadow.position.y = 0.04;
-  group.add(shadow);
-
-  const size = 1.95;
-  const spriteMesh = new THREE.Mesh(getSharedBillboardGeometry(size, size), mats.frame0);
-  spriteMesh.name = 'citizenSpriteQuad';
-  spriteMesh.castShadow = false;
-  group.add(spriteMesh);
-
-  group.userData = {
-    role,
-    factionColor,
-    mats,
-    spriteMesh,
-  };
 
   return group;
 }

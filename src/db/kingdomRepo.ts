@@ -1,5 +1,5 @@
-import { eq } from 'drizzle-orm';
-import { db } from './index.ts';
+import { eq, sql } from 'drizzle-orm';
+import { db, isDbConfigured } from './index.ts';
 import {
   kingdomSnapshots,
   users,
@@ -31,6 +31,9 @@ export interface KingdomSavePayload {
 }
 
 export async function getOrCreateUser(uid: string, email: string) {
+  if (!isDbConfigured || !db) {
+    return { id: 0, uid, email, createdAt: new Date() };
+  }
   try {
     const result = await db
       .insert(users)
@@ -54,6 +57,7 @@ export async function getOrCreateUser(uid: string, email: string) {
 }
 
 export async function loadKingdomByUid(uid: string, email: string) {
+  if (!isDbConfigured || !db) return null;
   try {
     const userRow = await getOrCreateUser(uid, email);
     const rows = await db
@@ -91,28 +95,23 @@ export async function saveKingdomByUid(
   email: string,
   payload: KingdomSavePayload
 ) {
+  if (!isDbConfigured || !db) {
+    return {
+      displayName: payload.displayName,
+      structuresCount: payload.structures.length,
+      unitsCount: payload.units.length,
+      updatedAt: new Date().toISOString(),
+    };
+  }
   try {
     const userRow = await getOrCreateUser(uid, email);
     const now = new Date();
-    const result = await db
-      .insert(kingdomSnapshots)
-      .values({
-        userId: userRow.id,
-        displayName: payload.displayName,
-        factionName: payload.factionName,
-        primaryColor: payload.primaryColor,
-        secondaryColor: payload.secondaryColor,
-        bannerPattern: payload.bannerPattern,
-        culture: payload.culture,
-        resourcesJson: payload.resources,
-        structuresJson: payload.structures,
-        unitsJson: payload.units,
-        cameraJson: payload.camera,
-        updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: kingdomSnapshots.userId,
-        set: {
+
+    const saved = await db.transaction(async (tx) => {
+      const result = await tx
+        .insert(kingdomSnapshots)
+        .values({
+          userId: userRow.id,
           displayName: payload.displayName,
           factionName: payload.factionName,
           primaryColor: payload.primaryColor,
@@ -124,65 +123,81 @@ export async function saveKingdomByUid(
           unitsJson: payload.units,
           cameraJson: payload.camera,
           updatedAt: now,
-        },
-      })
-      .returning();
+        })
+        .onConflictDoUpdate({
+          target: kingdomSnapshots.userId,
+          set: {
+            displayName: payload.displayName,
+            factionName: payload.factionName,
+            primaryColor: payload.primaryColor,
+            secondaryColor: payload.secondaryColor,
+            bannerPattern: payload.bannerPattern,
+            culture: payload.culture,
+            resourcesJson: payload.resources,
+            structuresJson: payload.structures,
+            unitsJson: payload.units,
+            cameraJson: payload.camera,
+            updatedAt: now,
+          },
+        })
+        .returning();
 
-    // Sync spatially indexed world_structures and world_units tables
-    await db.delete(worldStructures).where(eq(worldStructures.ownerUid, uid));
-    if (payload.structures.length > 0) {
-      const structRows = payload.structures.map((st) => {
-        const { sx, sz } = getSectorCoords(st.x, st.z);
-        return {
-          id: `${uid}_${st.id}`,
-          ownerUid: uid,
-          sectorX: sx,
-          sectorZ: sz,
-          x: st.x,
-          z: st.z,
-          kind: st.kind,
-          culture: st.culture ?? payload.culture,
-          level: st.level ?? 1,
-          hp: Math.round(st.hp),
-          maxHp: Math.round(st.maxHp),
-          rotationY: st.rotationY ?? 0,
-          isConstructing: Boolean(st.isConstructing),
-          constructionProgress: st.constructionProgress ?? 100,
-          dataJson: st,
-          updatedAt: now,
-        };
-      });
-      await db.insert(worldStructures).values(structRows).onConflictDoNothing();
-    }
+      await tx.delete(worldStructures).where(eq(worldStructures.ownerUid, uid));
+      if (payload.structures.length > 0) {
+        const structRows = payload.structures.map((st) => {
+          const { sx, sz } = getSectorCoords(st.x, st.z);
+          return {
+            id: `${uid}_${st.id}`,
+            ownerUid: uid,
+            sectorX: sx,
+            sectorZ: sz,
+            x: st.x,
+            z: st.z,
+            kind: st.kind,
+            culture: st.culture ?? payload.culture,
+            level: st.level ?? 1,
+            hp: Math.round(st.hp),
+            maxHp: Math.round(st.maxHp),
+            rotationY: st.rotationY ?? 0,
+            isConstructing: Boolean(st.isConstructing),
+            constructionProgress: st.constructionProgress ?? 100,
+            dataJson: st,
+            updatedAt: now,
+          };
+        });
+        await tx.insert(worldStructures).values(structRows).onConflictDoNothing();
+      }
 
-    await db.delete(worldUnits).where(eq(worldUnits.ownerUid, uid));
-    if (payload.units.length > 0) {
-      const unitRows = payload.units.map((u) => {
-        const { sx, sz } = getSectorCoords(u.x, u.z);
-        return {
-          id: `${uid}_${u.id}`,
-          ownerUid: uid,
-          sectorX: sx,
-          sectorZ: sz,
-          x: u.x,
-          z: u.z,
-          targetX: u.targetX,
-          targetZ: u.targetZ,
-          kind: u.kind,
-          speed: u.speed,
-          state: u.state,
-          waypointsJson: u.waypoints ?? null,
-          departedAtMs: u.departedAtMs ?? null,
-          etaServerMs: u.etaServerMs ?? null,
-          marchOrderLabelAr: u.marchOrderLabelAr ?? null,
-          dataJson: u,
-          updatedAt: now,
-        };
-      });
-      await db.insert(worldUnits).values(unitRows).onConflictDoNothing();
-    }
+      await tx.delete(worldUnits).where(eq(worldUnits.ownerUid, uid));
+      if (payload.units.length > 0) {
+        const unitRows = payload.units.map((u) => {
+          const { sx, sz } = getSectorCoords(u.x, u.z);
+          return {
+            id: `${uid}_${u.id}`,
+            ownerUid: uid,
+            sectorX: sx,
+            sectorZ: sz,
+            x: u.x,
+            z: u.z,
+            targetX: u.targetX,
+            targetZ: u.targetZ,
+            kind: u.kind,
+            speed: u.speed,
+            state: u.state,
+            waypointsJson: u.waypoints ?? null,
+            departedAtMs: u.departedAtMs ?? null,
+            etaServerMs: u.etaServerMs ?? null,
+            marchOrderLabelAr: u.marchOrderLabelAr ?? null,
+            dataJson: u,
+            updatedAt: now,
+          };
+        });
+        await tx.insert(worldUnits).values(unitRows).onConflictDoNothing();
+      }
 
-    const saved = result[0];
+      return result[0];
+    });
+
     return {
       displayName: saved.displayName,
       structuresCount: saved.structuresJson.length,
@@ -196,13 +211,16 @@ export async function saveKingdomByUid(
 }
 
 export async function deleteKingdomByUid(uid: string, email: string) {
+  if (!isDbConfigured || !db) return { deleted: true };
   try {
     const userRow = await getOrCreateUser(uid, email);
-    await db
-      .delete(kingdomSnapshots)
-      .where(eq(kingdomSnapshots.userId, userRow.id));
-    await db.delete(worldStructures).where(eq(worldStructures.ownerUid, uid));
-    await db.delete(worldUnits).where(eq(worldUnits.ownerUid, uid));
+    await db.transaction(async (tx) => {
+      await tx
+        .delete(kingdomSnapshots)
+        .where(eq(kingdomSnapshots.userId, userRow.id));
+      await tx.delete(worldStructures).where(eq(worldStructures.ownerUid, uid));
+      await tx.delete(worldUnits).where(eq(worldUnits.ownerUid, uid));
+    });
     return { deleted: true };
   } catch (error) {
     console.error('Database kingdom delete failed:', error);
@@ -211,6 +229,7 @@ export async function deleteKingdomByUid(uid: string, email: string) {
 }
 
 export async function loadAllResourceDeltas(): Promise<Record<string, number>> {
+  if (!isDbConfigured || !db) return {};
   try {
     const rows = await db.select().from(worldResourceDeltas);
     const map: Record<string, number> = {};
@@ -232,27 +251,26 @@ export async function upsertResourceDeltas(
     remainingAmount: number;
   }>
 ) {
-  if (deltas.length === 0) return;
+  if (!isDbConfigured || !db || deltas.length === 0) return;
   try {
     const now = new Date();
-    for (const d of deltas) {
-      await db
-        .insert(worldResourceDeltas)
-        .values({
-          nodeId: d.nodeId,
-          sectorX: d.sectorX,
-          sectorZ: d.sectorZ,
-          remainingAmount: d.remainingAmount,
+    const values = deltas.map((d) => ({
+      nodeId: d.nodeId,
+      sectorX: d.sectorX,
+      sectorZ: d.sectorZ,
+      remainingAmount: d.remainingAmount,
+      updatedAt: now,
+    }));
+    await db
+      .insert(worldResourceDeltas)
+      .values(values)
+      .onConflictDoUpdate({
+        target: worldResourceDeltas.nodeId,
+        set: {
+          remainingAmount: sql`excluded.remaining_amount`,
           updatedAt: now,
-        })
-        .onConflictDoUpdate({
-          target: worldResourceDeltas.nodeId,
-          set: {
-            remainingAmount: d.remainingAmount,
-            updatedAt: now,
-          },
-        });
-    }
+        },
+      });
   } catch (error) {
     console.warn('Resource delta persistence warning:', error);
   }

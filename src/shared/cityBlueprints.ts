@@ -21,14 +21,6 @@ export interface CityAvenueSpec {
   hasTrees?: boolean;
 }
 
-export interface CityCrowdHotspot {
-  x: number;
-  z: number;
-  radius: number;
-  weight: number;
-  kind: 'souq' | 'plaza' | 'harbor' | 'gate' | 'mosque' | 'caravan';
-}
-
 export type CityMonumentKind =
   | 'mirqab_round_imperial'
   | 'damascus_umayyad_straight'
@@ -53,8 +45,6 @@ export interface BespokeCityBlueprint {
   monumentKind: CityMonumentKind;
   outerRadius: number;
   plazaRadius: number;
-  crowdCount: number;
-  caravanCount: number;
   treeKind: 'palm' | 'cypress_olive' | 'mixed_oasis' | 'barren';
   customPalette?: {
     cobbleMain: number;
@@ -65,7 +55,6 @@ export interface BespokeCityBlueprint {
   };
   avenues: CityAvenueSpec[];
   ringRoads: Array<{ radius: number; width: number; arcStart?: number; arcEnd?: number }>;
-  hotspots: CityCrowdHotspot[];
   orchardZones: Array<{ x: number; z: number; radius: number; density: number }>;
   buildings: PlannedCityBuilding[];
   garrison: UnitKind[];
@@ -200,6 +189,7 @@ function addHouseCluster(
       dx,
       dz,
       rot,
+      exact: true,
     });
   }
 }
@@ -210,61 +200,68 @@ function addHouseCluster(
 // ============================================================================
 function buildMirqabBlueprint(): BespokeCityBlueprint {
   const buildings: PlannedCityBuilding[] = [
-    // Imperial Inner Core (Royal Palace Keep + Grand Mosque + Diwan Guards)
+    // Imperial Inner Core (Sultan Hassan Royal Palace Keep + Grand Mosque + Diwan Citadel)
     { kind: 'keep', level: 3, dx: 0, dz: 0, rot: 0, exact: true },
     { kind: 'temple', level: 3, dx: -11, dz: -9, rot: 0, exact: true },
     { kind: 'market', level: 3, dx: 11, dz: -9, rot: 0, exact: true },
     { kind: 'barracks', level: 3, dx: 11, dz: 10, rot: -Math.PI / 2, exact: true },
     { kind: 'war_tent', level: 2, dx: -11, dz: 10, rot: 0, exact: true },
+    // Inner Diwan Citadel Guard Watchtowers framing the Royal Plaza
+    { kind: 'watchtower', level: 3, dx: -15, dz: -15, rot: 0, exact: true },
+    { kind: 'watchtower', level: 3, dx: 15, dz: -15, rot: 0, exact: true },
+    { kind: 'watchtower', level: 3, dx: 15, dz: 15, rot: 0, exact: true },
+    { kind: 'watchtower', level: 3, dx: -15, dz: 15, rot: 0, exact: true },
 
-    // Four Grand Bazaar Markets flanking the 4 Imperial Gate Boulevards
-    { kind: 'market', level: 3, dx: -24, dz: -7.5, rot: 0 },
-    { kind: 'market', level: 2, dx: 24, dz: 7.5, rot: Math.PI },
-    { kind: 'market', level: 2, dx: -7.5, dz: 25, rot: Math.PI / 2 },
+    // Grand Bazaar Markets flanking the Imperial Gate Boulevards
+    { kind: 'market', level: 3, dx: -24, dz: -7.5, rot: 0, exact: true },
+    { kind: 'market', level: 2, dx: 24, dz: 7.5, rot: Math.PI, exact: true },
+    { kind: 'market', level: 2, dx: -7.5, dz: 25, rot: Math.PI / 2, exact: true },
 
     // Imperial Military & Siege Quarter (East-South Sector)
-    { kind: 'barracks', level: 2, dx: 25, dz: -15, rot: 0 },
-    { kind: 'horse_stable', level: 3, dx: 31, dz: -9, rot: -Math.PI / 2 },
-    { kind: 'siege_workshop', level: 3, dx: 29, dz: 18, rot: 0 },
+    { kind: 'barracks', level: 3, dx: 25, dz: -15, rot: 0, exact: true },
+    { kind: 'horse_stable', level: 3, dx: 31, dz: -8, rot: -Math.PI / 2, exact: true },
+    { kind: 'siege_workshop', level: 3, dx: 29, dz: 18, rot: 0, exact: true },
 
     // Outer Agricultural & Supply Suburbs beyond the Grand Moat
-    { kind: 'farm', level: 3, dx: -56, dz: -16, rot: 0 },
-    { kind: 'farm', level: 2, dx: -56, dz: 16, rot: 0 },
-    { kind: 'farm', level: 2, dx: 56, dz: -14, rot: 0 },
-    { kind: 'livestock_ranch', level: 2, dx: 55, dz: 18, rot: 0 },
-    { kind: 'quarry', level: 2, dx: -18, dz: -56, rot: 0 },
-    { kind: 'lumber_camp', level: 2, dx: 22, dz: -56, rot: 0 },
+    { kind: 'farm', level: 3, dx: -56, dz: -16, rot: 0, exact: true },
+    { kind: 'farm', level: 2, dx: -56, dz: 16, rot: 0, exact: true },
+    { kind: 'farm', level: 2, dx: 56, dz: -14, rot: 0, exact: true },
+    { kind: 'livestock_ranch', level: 2, dx: 55, dz: 18, rot: 0, exact: true },
+    { kind: 'quarry', level: 2, dx: -18, dz: -56, rot: 0, exact: true },
+    { kind: 'lumber_camp', level: 2, dx: 22, dz: -56, rot: 0, exact: true },
   ];
 
-  // Dense Concentric Residential Quarters (20 Real Lv.2-3 Courtyard Houses in 4 Quadrants!)
+  // Dense Concentric Residential Quarters (22 Real Lv.2-3 Courtyard Houses in 4 Quadrants)
   addHouseCluster(buildings, [
     // NW Quarter (Karkh / Scholars' Quarter)
-    [-21, -21, 3, 0],
-    [-29, -15, 3, Math.PI / 2],
-    [-15, -29, 2, 0],
-    [-27, -26, 2, Math.PI],
+    [-22, -22, 3, 0],
+    [-30, -15, 3, Math.PI / 2],
+    [-14, -29, 2, 0],
+    [-27, -27, 2, Math.PI],
     [-35, -8, 2, Math.PI / 2],
     // NE Quarter (Rusafa Noble Villas)
-    [20, -24, 3, 0],
+    [22, -24, 3, 0],
     [13, -31, 3, -Math.PI / 2],
-    [28, -24, 2, Math.PI],
-    [8, -22, 2, 0],
-    [35, -18, 2, -Math.PI / 2],
+    [29, -24, 2, Math.PI],
+    [7, -23, 2, 0],
+    [36, -17, 2, -Math.PI / 2],
     // SW Quarter (Bazaar Artisans)
-    [-21, 20, 3, 0],
-    [-29, 14, 3, Math.PI / 2],
-    [-16, 29, 2, Math.PI],
-    [-28, 26, 2, 0],
+    [-22, 22, 3, 0],
+    [-30, 14, 3, Math.PI / 2],
+    [-16, 30, 2, Math.PI],
+    [-28, 27, 2, 0],
     [-35, 9, 2, Math.PI / 2],
+    [-23, 7.5, 2, Math.PI],
     // SE Quarter (River Merchants)
-    [19, 22, 3, 0],
+    [22, 22, 3, 0],
     [13, 31, 2, -Math.PI / 2],
-    [26, 27, 2, Math.PI],
+    [28, 27, 2, Math.PI],
     [35, 9, 2, -Math.PI / 2],
-    [-8, 35, 2, 0],
+    [-7.5, -24, 2, 0],
+    [7.5, 25, 2, Math.PI],
   ]);
 
-  // Monumental 12-Sided Circular Imperial Outer Wall (R = 45m) with 4 Grand Gates + Water Moat!
+  // Monumental 12-Sided Circular Imperial Outer Wall (R = 45.5m) with 4 Grand Gates + Water Moat!
   const ringVerts: Array<[number, number]> = [];
   const sides = 12;
   const R = 45.5;
@@ -286,8 +283,6 @@ function buildMirqabBlueprint(): BespokeCityBlueprint {
     monumentKind: 'mirqab_round_imperial',
     outerRadius: 68,
     plazaRadius: 15,
-    crowdCount: 340,
-    caravanCount: 16,
     treeKind: 'palm',
     customPalette: {
       cobbleMain: 0xcab082,
@@ -306,14 +301,6 @@ function buildMirqabBlueprint(): BespokeCityBlueprint {
       { radius: 17.5, width: 3.0 },
       { radius: 34.5, width: 3.2 },
     ],
-    hotspots: [
-      { x: 0, z: 0, radius: 13, weight: 2.2, kind: 'plaza' },
-      { x: -24, z: -6, radius: 9, weight: 2.0, kind: 'souq' },
-      { x: 24, z: 6, radius: 9, weight: 1.8, kind: 'souq' },
-      { x: -11, z: -9, radius: 8, weight: 1.6, kind: 'mosque' },
-      { x: 0, z: 45, radius: 7, weight: 1.5, kind: 'gate' },
-      { x: -45, z: 0, radius: 7, weight: 1.5, kind: 'gate' },
-    ],
     orchardZones: [
       { x: -56, z: -26, radius: 14, density: 18 },
       { x: 56, z: 24, radius: 14, density: 16 },
@@ -321,10 +308,12 @@ function buildMirqabBlueprint(): BespokeCityBlueprint {
     ],
     buildings,
     garrison: [
-      'worker', 'worker', 'worker',
-      'commander', 'knight', 'knight', 'knight',
-      'infantry', 'infantry', 'infantry',
-      'spearman', 'spearman', 'archer', 'archer', 'archer',
+      'worker', 'worker', 'worker', 'worker',
+      'commander', 'commander', 'knight', 'knight', 'knight', 'knight',
+      'infantry', 'infantry', 'infantry', 'infantry',
+      'spearman', 'spearman', 'spearman',
+      'archer', 'archer', 'archer', 'archer',
+      'trebuchet',
     ],
   };
 }
@@ -411,8 +400,6 @@ function buildDamascusBlueprint(): BespokeCityBlueprint {
     monumentKind: 'damascus_umayyad_straight',
     outerRadius: 68,
     plazaRadius: 13,
-    crowdCount: 310,
-    caravanCount: 14,
     treeKind: 'cypress_olive',
     customPalette: {
       cobbleMain: 0xbcb2a0,
@@ -430,14 +417,6 @@ function buildDamascusBlueprint(): BespokeCityBlueprint {
       { ax: -54, az: -35, bx: 54, bz: -35, width: 3.4, isCanal: true, hasTrees: true },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 4, z: -14, radius: 11, weight: 2.2, kind: 'mosque' },
-      { x: 2, z: 2, radius: 12, weight: 2.3, kind: 'souq' },
-      { x: 24, z: 2, radius: 9, weight: 1.7, kind: 'souq' },
-      { x: -30, z: -18, radius: 8, weight: 1.3, kind: 'plaza' },
-      { x: 44, z: 0, radius: 7, weight: 1.4, kind: 'gate' },
-      { x: -44, z: 0, radius: 7, weight: 1.4, kind: 'gate' },
-    ],
     orchardZones: [
       { x: -56, z: -8, radius: 15, density: 20 },
       { x: 56, z: 0, radius: 16, density: 22 },
@@ -530,8 +509,6 @@ function buildAleppoBlueprint(): BespokeCityBlueprint {
     monumentKind: 'aleppo_glacis_citadel',
     outerRadius: 64,
     plazaRadius: 14,
-    crowdCount: 280,
-    caravanCount: 13,
     treeKind: 'cypress_olive',
     customPalette: {
       cobbleMain: 0xb8b2a6,
@@ -545,13 +522,6 @@ function buildAleppoBlueprint(): BespokeCityBlueprint {
       { ax: 8, az: 8, bx: 48, bz: 8, width: 3.4 },
     ],
     ringRoads: [{ radius: 22.5, width: 2.8 }],
-    hotspots: [
-      { x: -14, z: 3, radius: 12, weight: 2.5, kind: 'souq' },
-      { x: 8, z: -4, radius: 9, weight: 1.6, kind: 'plaza' },
-      { x: -16, z: -12, radius: 8, weight: 1.7, kind: 'mosque' },
-      { x: -39, z: 0, radius: 7, weight: 1.5, kind: 'gate' },
-      { x: 0, z: 37, radius: 7, weight: 1.4, kind: 'gate' },
-    ],
     orchardZones: [
       { x: -50, z: 22, radius: 13, density: 15 },
       { x: -48, z: -22, radius: 12, density: 14 },
@@ -657,8 +627,6 @@ function buildRusafaBasraBlueprint(): BespokeCityBlueprint {
     monumentKind: 'basra_harbor_canals',
     outerRadius: 66,
     plazaRadius: 12,
-    crowdCount: 300,
-    caravanCount: 14,
     treeKind: 'palm',
     customPalette: {
       cobbleMain: 0xc2a57a,
@@ -676,13 +644,6 @@ function buildRusafaBasraBlueprint(): BespokeCityBlueprint {
       { ax: 0, az: -48, bx: 0, bz: 26, width: 4.4, hasTrees: true },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 0, z: 20, radius: 14, weight: 2.6, kind: 'harbor' },
-      { x: -16, z: 16, radius: 10, weight: 2.0, kind: 'souq' },
-      { x: 16, z: 16, radius: 10, weight: 2.0, kind: 'souq' },
-      { x: -15, z: -14, radius: 8, weight: 1.5, kind: 'mosque' },
-      { x: 0, z: -34, radius: 7, weight: 1.5, kind: 'gate' },
-    ],
     orchardZones: [
       { x: -54, z: -22, radius: 16, density: 22 },
       { x: 54, z: -22, radius: 16, density: 22 },
@@ -704,11 +665,13 @@ function buildRusafaBasraBlueprint(): BespokeCityBlueprint {
 // ============================================================================
 function buildJerusalemBlueprint(): BespokeCityBlueprint {
   const buildings: PlannedCityBuilding[] = [
-    // Western Crusader Citadel (Tower of David / قلعة الساحل الغربي)
+    // Western Royal Citadel (قلعة بيت المقدس / Tower of David)
     { kind: 'keep', level: 3, dx: -27, dz: 2, rot: 0, exact: true },
-    { kind: 'barracks', level: 3, dx: -26, dz: -10, rot: 0 },
-    { kind: 'horse_stable', level: 3, dx: -26, dz: 14, rot: 0 },
-    { kind: 'siege_workshop', level: 2, dx: -17, dz: 24, rot: 0 },
+    { kind: 'barracks', level: 3, dx: -26, dz: -10, rot: 0, exact: true },
+    { kind: 'horse_stable', level: 3, dx: -26, dz: 14, rot: 0, exact: true },
+    { kind: 'siege_workshop', level: 2, dx: -17, dz: 24, rot: 0, exact: true },
+    { kind: 'watchtower', level: 3, dx: -19, dz: -4, rot: 0, exact: true },
+    { kind: 'watchtower', level: 3, dx: -19, dz: 8, rot: 0, exact: true },
 
     // Eastern Raised Sacred Esplanade & Great Dome Sanctuary
     { kind: 'temple', level: 3, dx: 22, dz: -2, rot: 0, exact: true },
@@ -716,36 +679,40 @@ function buildJerusalemBlueprint(): BespokeCityBlueprint {
     // Central Colonnaded Cardo Markets
     { kind: 'market', level: 3, dx: -4, dz: -8, rot: 0, exact: true },
     { kind: 'market', level: 2, dx: -4, dz: 10, rot: 0, exact: true },
-    { kind: 'barracks', level: 2, dx: 12, dz: -24, rot: 0 },
+    { kind: 'barracks', level: 2, dx: 12, dz: -24, rot: 0, exact: true },
+    { kind: 'war_tent', level: 2, dx: 22, dz: 12, rot: 0, exact: true },
 
     // Terraced Olive Hills & Limestone Quarries outside the Walls
-    { kind: 'farm', level: 2, dx: 52, dz: -12, rot: 0 },
-    { kind: 'farm', level: 2, dx: -52, dz: 12, rot: 0 },
-    { kind: 'quarry', level: 3, dx: -12, dz: -50, rot: 0 },
-    { kind: 'livestock_ranch', level: 2, dx: 14, dz: 50, rot: 0 },
+    { kind: 'farm', level: 2, dx: 52, dz: -12, rot: 0, exact: true },
+    { kind: 'farm', level: 2, dx: -52, dz: 12, rot: 0, exact: true },
+    { kind: 'quarry', level: 3, dx: -12, dz: -50, rot: 0, exact: true },
+    { kind: 'livestock_ranch', level: 2, dx: 14, dz: 50, rot: 0, exact: true },
   ];
 
-  // Four Historic Stone-Vaulted Quarters (15 Real Golden-Limestone Houses)
+  // Four Historic Stone-Vaulted Quarters (18 Real Golden-Limestone Houses)
   addHouseCluster(buildings, [
     // NW Quarter
     [-16, -24, 3, 0],
     [-6, -24, 3, Math.PI / 2],
     [-16, -14, 2, 0],
-    [-14, -3, 2, Math.PI],
+    [-13, -3, 2, Math.PI],
     // NE Quarter
     [4, -24, 3, 0],
     [4, -14, 2, Math.PI / 2],
     [24, -22, 3, 0],
     [31, -15, 2, -Math.PI / 2],
+    [13, -12, 3, 0],
     // SW Quarter
-    [-16, 12, 3, 0],
+    [-16, 14, 3, 0],
     [-25, 24, 2, Math.PI / 2],
     [-6, 24, 3, 0],
-    [-14, 4, 2, Math.PI],
+    [-13, 5, 2, Math.PI],
     // SE Quarter
     [6, 14, 3, 0],
     [16, 22, 2, Math.PI / 2],
-    [26, 20, 2, 0],
+    [28, 22, 2, 0],
+    [31, -4, 3, -Math.PI / 2],
+    [31, 9, 2, Math.PI / 2],
   ]);
 
   // Monumental Trapezoidal Golden-Limestone City Wall (80m x 76m) with 4 Historic Gates
@@ -773,8 +740,6 @@ function buildJerusalemBlueprint(): BespokeCityBlueprint {
     monumentKind: 'jerusalem_sacred_terrace',
     outerRadius: 62,
     plazaRadius: 14,
-    crowdCount: 270,
-    caravanCount: 12,
     treeKind: 'cypress_olive',
     customPalette: {
       cobbleMain: 0xd9c8a2, // Iconic Jerusalem golden limestone
@@ -789,23 +754,16 @@ function buildJerusalemBlueprint(): BespokeCityBlueprint {
       { ax: -48, az: 0, bx: 48, bz: 0, width: 4.0, hasSouqCanopies: true },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 22, z: -2, radius: 13, weight: 2.3, kind: 'mosque' },
-      { x: -4, z: 0, radius: 11, weight: 2.2, kind: 'souq' },
-      { x: -27, z: 2, radius: 9, weight: 1.5, kind: 'plaza' },
-      { x: 0, z: -35, radius: 7, weight: 1.6, kind: 'gate' },
-      { x: -38, z: 0, radius: 7, weight: 1.5, kind: 'gate' },
-    ],
     orchardZones: [
       { x: 52, z: 6, radius: 14, density: 18 }, // Mount of Olives grove
       { x: -50, z: -18, radius: 12, density: 13 },
     ],
     buildings,
     garrison: [
-      'worker', 'worker',
-      'commander', 'knight', 'knight', 'knight',
-      'infantry', 'infantry', 'infantry',
-      'spearman', 'spearman', 'archer', 'archer',
+      'worker', 'worker', 'worker',
+      'commander', 'knight', 'knight', 'knight', 'knight',
+      'infantry', 'infantry', 'infantry', 'infantry',
+      'spearman', 'spearman', 'spearman', 'archer', 'archer', 'archer',
     ],
   };
 }
@@ -871,19 +829,12 @@ function buildMosulBlueprint(): BespokeCityBlueprint {
     monumentKind: 'mosul_leaning_minaret',
     outerRadius: 58,
     plazaRadius: 11,
-    crowdCount: 220,
-    caravanCount: 10,
     treeKind: 'cypress_olive',
     avenues: [
       { ax: -46, az: 4, bx: 44, bz: 4, width: 4.0, hasSouqCanopies: true },
       { ax: 0, az: -44, bx: 0, bz: 44, width: 3.6, hasTrees: true },
     ],
     ringRoads: [{ radius: 19, width: 2.6 }],
-    hotspots: [
-      { x: -4, z: -4, radius: 10, weight: 2.0, kind: 'mosque' },
-      { x: 4, z: 10, radius: 11, weight: 2.1, kind: 'souq' },
-      { x: 20, z: -18, radius: 8, weight: 1.4, kind: 'plaza' },
-    ],
     orchardZones: [
       { x: -46, z: 20, radius: 12, density: 14 },
       { x: 44, z: 0, radius: 11, density: 12 },
@@ -953,8 +904,6 @@ function buildAntiochBlueprint(): BespokeCityBlueprint {
     monumentKind: 'antioch_mountain_bastion',
     outerRadius: 56,
     plazaRadius: 11,
-    crowdCount: 200,
-    caravanCount: 9,
     treeKind: 'cypress_olive',
     customPalette: {
       cobbleMain: 0xb6ad9c,
@@ -967,11 +916,6 @@ function buildAntiochBlueprint(): BespokeCityBlueprint {
       { ax: -6, az: -36, bx: -6, bz: 36, width: 3.4 },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: -10, z: 6, radius: 11, weight: 2.2, kind: 'souq' },
-      { x: 20, z: 0, radius: 9, weight: 1.5, kind: 'plaza' },
-      { x: -10, z: -6, radius: 8, weight: 1.6, kind: 'mosque' },
-    ],
     orchardZones: [
       { x: -46, z: 16, radius: 12, density: 14 },
       { x: -44, z: -18, radius: 12, density: 14 },
@@ -1044,8 +988,6 @@ function buildKufaBlueprint(): BespokeCityBlueprint {
     monumentKind: 'kufa_rahba_grid',
     outerRadius: 60,
     plazaRadius: 15,
-    crowdCount: 230,
-    caravanCount: 11,
     treeKind: 'palm',
     avenues: [
       { ax: -50, az: 0, bx: 50, bz: 0, width: 4.8, hasSouqCanopies: true, hasTrees: true },
@@ -1054,12 +996,6 @@ function buildKufaBlueprint(): BespokeCityBlueprint {
       { ax: -34, az: 19, bx: 34, bz: 19, width: 2.6 },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 0, z: -7, radius: 12, weight: 2.2, kind: 'mosque' },
-      { x: -14, z: 0, radius: 9, weight: 1.9, kind: 'souq' },
-      { x: 14, z: 0, radius: 9, weight: 1.9, kind: 'souq' },
-      { x: 0, z: 37, radius: 7, weight: 1.4, kind: 'gate' },
-    ],
     orchardZones: [
       { x: 50, z: 0, radius: 15, density: 20 },
       { x: -48, z: -18, radius: 12, density: 14 },
@@ -1123,19 +1059,12 @@ function buildNusaybinBlueprint(): BespokeCityBlueprint {
     monumentKind: 'nusaybin_hex_fortress',
     outerRadius: 56,
     plazaRadius: 11,
-    crowdCount: 185,
-    caravanCount: 8,
     treeKind: 'cypress_olive',
     avenues: [
       { ax: 0, az: -46, bx: 0, bz: 46, width: 4.2, hasSouqCanopies: true },
       { ax: -36, az: 0, bx: 36, bz: 0, width: 3.4 },
     ],
     ringRoads: [{ radius: 18, width: 2.6 }],
-    hotspots: [
-      { x: 0, z: 0, radius: 10, weight: 1.8, kind: 'plaza' },
-      { x: 10, z: 20, radius: 9, weight: 2.0, kind: 'souq' },
-      { x: 0, z: 34, radius: 7, weight: 1.5, kind: 'gate' },
-    ],
     orchardZones: [{ x: -46, z: 16, radius: 12, density: 13 }],
     buildings,
     garrison: [
@@ -1201,8 +1130,6 @@ function buildHomsBlueprint(): BespokeCityBlueprint {
     monumentKind: 'homs_basalt_citadel',
     outerRadius: 56,
     plazaRadius: 11,
-    crowdCount: 180,
-    caravanCount: 9,
     treeKind: 'cypress_olive',
     customPalette: {
       cobbleMain: 0x67625c, // Distinctive dark volcanic basalt of Homs!
@@ -1215,11 +1142,6 @@ function buildHomsBlueprint(): BespokeCityBlueprint {
       { ax: -42, az: -4, bx: 42, bz: -4, width: 3.6, hasSouqCanopies: true },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 6, z: -5, radius: 11, weight: 2.1, kind: 'souq' },
-      { x: -8, z: -8, radius: 8, weight: 1.7, kind: 'mosque' },
-      { x: 0, z: 19, radius: 9, weight: 1.4, kind: 'plaza' },
-    ],
     orchardZones: [
       { x: -46, z: -12, radius: 13, density: 15 },
       { x: 46, z: -12, radius: 13, density: 15 },
@@ -1289,19 +1211,12 @@ function buildRaqqaBlueprint(): BespokeCityBlueprint {
     monumentKind: 'raqqa_horseshoe_gate',
     outerRadius: 56,
     plazaRadius: 11,
-    crowdCount: 175,
-    caravanCount: 9,
     treeKind: 'palm',
     avenues: [
       { ax: -42, az: 10, bx: 42, bz: 10, width: 4.0, hasSouqCanopies: true },
       { ax: 0, az: -42, bx: 0, bz: 36, width: 3.6, hasTrees: true },
     ],
     ringRoads: [{ radius: 19, width: 2.4, arcStart: Math.PI, arcEnd: Math.PI * 2 }],
-    hotspots: [
-      { x: -4, z: 10, radius: 11, weight: 2.1, kind: 'souq' },
-      { x: -4, z: -10, radius: 9, weight: 1.7, kind: 'mosque' },
-      { x: 32, z: 18, radius: 8, weight: 1.5, kind: 'gate' },
-    ],
     orchardZones: [
       { x: -44, z: 22, radius: 12, density: 14 },
       { x: 44, z: 22, radius: 12, density: 14 },
@@ -1364,19 +1279,12 @@ function buildTikritBlueprint(): BespokeCityBlueprint {
     monumentKind: 'tikrit_cliff_rampart',
     outerRadius: 52,
     plazaRadius: 10,
-    crowdCount: 165,
-    caravanCount: 8,
     treeKind: 'palm',
     avenues: [
       { ax: -2, az: -46, bx: -2, bz: 46, width: 4.2, hasSouqCanopies: true },
       { ax: -34, az: 0, bx: 18, bz: 0, width: 3.4 },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: -6, z: 6, radius: 10, weight: 2.1, kind: 'souq' },
-      { x: 12, z: 0, radius: 9, weight: 1.5, kind: 'plaza' },
-      { x: 0, z: 36, radius: 7, weight: 1.4, kind: 'gate' },
-    ],
     orchardZones: [{ x: -36, z: 12, radius: 11, density: 12 }],
     buildings,
     garrison: [
@@ -1452,8 +1360,6 @@ function buildAcreBlueprint(): BespokeCityBlueprint {
     monumentKind: 'acre_crusader_port',
     outerRadius: 56,
     plazaRadius: 11,
-    crowdCount: 190,
-    caravanCount: 8,
     treeKind: 'cypress_olive',
     customPalette: {
       cobbleMain: 0xc8bca6,
@@ -1468,11 +1374,6 @@ function buildAcreBlueprint(): BespokeCityBlueprint {
       { ax: -24, az: -2, bx: 44, bz: -2, width: 3.4 },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: -10, z: 18, radius: 12, weight: 2.5, kind: 'harbor' },
-      { x: 2, z: 14, radius: 10, weight: 2.0, kind: 'souq' },
-      { x: 4, z: -14, radius: 8, weight: 1.4, kind: 'plaza' },
-    ],
     orchardZones: [{ x: 46, z: 4, radius: 12, density: 13 }],
     buildings,
     garrison: [
@@ -1533,8 +1434,6 @@ function buildHejazMaridBlueprint(): BespokeCityBlueprint {
     monumentKind: 'marid_oasis_fort',
     outerRadius: 50,
     plazaRadius: 10,
-    crowdCount: 145,
-    caravanCount: 10,
     treeKind: 'palm',
     customPalette: {
       cobbleMain: 0xdccbb0,
@@ -1547,11 +1446,6 @@ function buildHejazMaridBlueprint(): BespokeCityBlueprint {
       { ax: -34, az: 6, bx: 34, bz: 6, width: 3.4, hasTrees: true },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 11, z: 6, radius: 10, weight: 2.1, kind: 'caravan' },
-      { x: -11, z: 6, radius: 8, weight: 1.7, kind: 'mosque' },
-      { x: 0, z: 26, radius: 7, weight: 1.5, kind: 'gate' },
-    ],
     orchardZones: [
       { x: -34, z: 16, radius: 14, density: 20 },
       { x: 34, z: 16, radius: 14, density: 20 },
@@ -1608,8 +1502,6 @@ function buildPalmyraBlueprint(): BespokeCityBlueprint {
     monumentKind: 'palmyra_colonnade_oasis',
     outerRadius: 56,
     plazaRadius: 11,
-    crowdCount: 160,
-    caravanCount: 15, // Highest caravan traffic in the desert!
     treeKind: 'mixed_oasis',
     customPalette: {
       cobbleMain: 0xd4b68c,
@@ -1623,11 +1515,6 @@ function buildPalmyraBlueprint(): BespokeCityBlueprint {
       { ax: 0, az: -32, bx: 0, bz: 34, width: 3.6, hasTrees: true },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 0, z: 4, radius: 13, weight: 2.4, kind: 'caravan' },
-      { x: -16, z: 6, radius: 10, weight: 1.8, kind: 'souq' },
-      { x: 24, z: 0, radius: 9, weight: 1.5, kind: 'plaza' },
-    ],
     orchardZones: [
       { x: -14, z: 28, radius: 12, density: 18 },
       { x: 14, z: 28, radius: 12, density: 18 },
@@ -1691,8 +1578,6 @@ function buildBlackValleyBlueprint(): BespokeCityBlueprint {
     monumentKind: 'black_valley_prison',
     outerRadius: 50,
     plazaRadius: 10,
-    crowdCount: 95, // Wardens, chain-gang laborers & supply handlers
-    caravanCount: 4,
     treeKind: 'barren',
     customPalette: {
       cobbleMain: 0x4b4642,
@@ -1705,10 +1590,6 @@ function buildBlackValleyBlueprint(): BespokeCityBlueprint {
       { ax: -28, az: 0, bx: 28, bz: 0, width: 3.0 },
     ],
     ringRoads: [],
-    hotspots: [
-      { x: 0, z: 0, radius: 9, weight: 1.5, kind: 'plaza' },
-      { x: 0, z: 27, radius: 7, weight: 1.8, kind: 'gate' },
-    ],
     orchardZones: [],
     buildings,
     garrison: [

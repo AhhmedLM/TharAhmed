@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef, useState } from 'react';
 import {
   ArrowRightLeft,
   Box,
@@ -7,6 +7,7 @@ import {
   CloudSnow,
   CloudUpload,
   Compass,
+  Crown,
   Droplets,
   Eye,
   Home,
@@ -18,10 +19,13 @@ import {
   RefreshCw,
   Shield,
   Sliders,
+  Sparkles,
   Store,
   Sun,
+  Swords,
   TrendingUp,
   Users,
+  Volume2,
   Wind,
   X,
 } from 'lucide-react';
@@ -30,6 +34,7 @@ import {
   BannerPatternKind,
   BlockoutStructure,
   BlockoutUnit,
+  DiplomacyRelation,
   FACTION_PRIMARY_SWATCHES,
   FACTION_SECONDARY_SWATCHES,
   MarchWaypoint,
@@ -41,6 +46,7 @@ import {
   PlayerState,
   WorldState,
 } from '../shared/protocol';
+import { soundFx } from '../utils/soundFx';
 import {
   BIOME_SPECS,
   BiomeKind,
@@ -175,7 +181,6 @@ export interface ChronicleModalsProps {
       moodSummaryAr: string;
       happinessPct: number;
       prosperityBonusPct: number;
-      ambientCitizensCount: number;
       farmersCount: number;
       merchantsCount: number;
       scholarsCount: number;
@@ -240,6 +245,12 @@ export interface ChronicleModalsProps {
   rttMs: number;
   tickRateHz: number;
   onResetWorld: () => void;
+  onAdaptAllToBiomes?: () => void;
+  onDiplomacyAction?: (
+    targetId: string,
+    action: 'declare_war' | 'propose_ally' | 'accept_ally' | 'break_ally' | 'set_neutral'
+  ) => void;
+  onClaimSultanHassan?: () => void;
 }
 
 const renderClimateIcon = (climateId: ClimateKind, className = 'w-4 h-4') => {
@@ -313,7 +324,33 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
   rttMs,
   tickRateHz,
   onResetWorld,
+  onAdaptAllToBiomes,
+  onDiplomacyAction,
+  onClaimSultanHassan,
 }) => {
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [sfxVolume, setSfxVolume] = useState<number>(() => Math.round(soundFx.getVolume() * 100));
+  const colorDebounceRef = useRef<number | null>(null);
+
+  const scheduleColorHeraldry = (patch: { primaryColor?: string; secondaryColor?: string }) => {
+    if (colorDebounceRef.current) window.clearTimeout(colorDebounceRef.current);
+    colorDebounceRef.current = window.setTimeout(() => {
+      onApplyHeraldry(patch);
+    }, 250);
+  };
+
+  const getRel = (otherId: string): DiplomacyRelation => {
+    if (!playerId || !worldState) return 'neutral';
+    const key = playerId < otherId ? `${playerId}::${otherId}` : `${otherId}::${playerId}`;
+    const explicit = worldState.diplomacy?.[key];
+    if (explicit) return explicit;
+    const other = worldState.players?.[otherId];
+    if (other?.isAi || other?.isBandit) return 'war';
+    const pvp = worldState.directorConfig?.pvpMode ?? 'diplomacy';
+    if (pvp === 'free_for_all') return 'war';
+    if (pvp === 'coop') return 'ally';
+    return 'neutral';
+  };
   return (
     <div
       className="pointer-events-auto fixed inset-0 z-40 flex items-center justify-center p-1 sm:p-4 bg-black/75"
@@ -815,7 +852,7 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
                     className="px-3 py-1.5 rts2k-bevel-btn-emerald text-xs font-bold flex items-center gap-1.5 cursor-pointer"
                   >
                     <Eye className="w-3.5 h-3.5" />
-                    <span>مشاهدة الأحياء ({economyStats.popLifeReport.ambientCitizensCount})</span>
+                    <span>مشاهدة الأحياء والعمال ({myUnits.filter((u) => u.kind === 'worker').length})</span>
                   </button>
                 </div>
 
@@ -1206,6 +1243,106 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
                     ))}
                   </div>
                 </div>
+
+                {/* Diplomacy, Online Rivals & Sultan Hassan Role */}
+                <div className="p-3 rts2k-ink-well space-y-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-[#ffe8b3] flex items-center gap-1.5">
+                      <Swords className="w-3.5 h-3.5 text-[#f59e0b]" />
+                      <span>الدبلوماسية والمنافسون</span>
+                    </span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 bg-black/50 border border-[#7c5c2c] text-[#fde047]">
+                      {worldState?.directorConfig?.pvpMode === 'free_for_all'
+                        ? 'حرب مفتوحة (PvP)'
+                        : worldState?.directorConfig?.pvpMode === 'coop'
+                          ? 'تعاوني (Co-op)'
+                          : 'دبلوماسية وتحالفات'}
+                    </span>
+                  </div>
+
+                  {worldState?.directorConfig?.sultanHassanMode === 'human_claimable' &&
+                    !playersList.some((p) => !p.isAi && p.isSultanHassan) &&
+                    onClaimSultanHassan && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onClaimSultanHassan();
+                          onClose();
+                        }}
+                        className="w-full py-2 px-3 rts2k-bevel-btn-gold text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Crown className="w-4 h-4" />
+                        <span>تولّي عرش السلطان حسن وقيادة الدولة السندية في مرقاب</span>
+                      </button>
+                    )}
+
+                  <div className="space-y-1.5 max-h-40 overflow-y-auto pr-0.5">
+                    {playersList
+                      .filter((p) => p.id !== playerId && !p.isBandit)
+                      .map((other) => {
+                        const rel = getRel(other.id);
+                        return (
+                          <div
+                            key={other.id}
+                            className="p-1.5 bg-[#120d07] border border-[#5c4320] flex flex-wrap items-center justify-between gap-1.5 text-[11px]"
+                          >
+                            <div className="min-w-0 flex items-center gap-1.5">
+                              <span
+                                className="w-2.5 h-2.5 shrink-0 border border-white/40"
+                                style={{ backgroundColor: other.color }}
+                              />
+                              <span className="font-bold text-[#ffe8b3] truncate max-w-[130px]">
+                                {other.name}
+                              </span>
+                              <span
+                                className={`text-[9.5px] px-1 border font-bold ${
+                                  rel === 'war'
+                                    ? 'border-rose-500 text-rose-300 bg-rose-950/60'
+                                    : rel === 'ally'
+                                      ? 'border-emerald-500 text-emerald-300 bg-emerald-950/60'
+                                      : 'border-amber-500 text-amber-300 bg-amber-950/60'
+                                }`}
+                              >
+                                {rel === 'war' ? 'حرب' : rel === 'ally' ? 'تحالف' : 'هدنة'}
+                              </span>
+                            </div>
+
+                            {onDiplomacyAction && !other.isAi && (
+                              <div className="flex items-center gap-1">
+                                {rel !== 'war' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onDiplomacyAction(other.id, 'declare_war')}
+                                    className="px-1.5 py-0.5 bg-rose-900 hover:bg-rose-800 text-white text-[10px] font-bold cursor-pointer"
+                                  >
+                                    حرب
+                                  </button>
+                                )}
+                                {rel !== 'ally' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onDiplomacyAction(other.id, 'propose_ally')}
+                                    className="px-1.5 py-0.5 bg-emerald-800 hover:bg-emerald-700 text-white text-[10px] font-bold cursor-pointer"
+                                  >
+                                    تحالف
+                                  </button>
+                                )}
+                                {rel !== 'neutral' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onDiplomacyAction(other.id, 'set_neutral')}
+                                    className="px-1.5 py-0.5 bg-slate-700 hover:bg-slate-600 text-white text-[10px] font-bold cursor-pointer"
+                                  >
+                                    هدنة
+                                  </button>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -1304,7 +1441,7 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
                       />
                       <div className="text-[10px] leading-tight">
                         <div className="font-bold text-[#ffe8b3] truncate max-w-[110px]">
-                          {customKingdomName || myPlayer?.name || 'مملكة الحصون'}
+                          {customKingdomName || myPlayer?.name || 'مملكة ثار أحمد'}
                         </div>
                         <div className="text-[#fde047] font-mono text-[9px]">
                           {BANNER_PATTERN_SPECS[customBannerPattern].nameAr}
@@ -1357,7 +1494,7 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
                           onChange={(e) => {
                             const val = e.target.value;
                             setCustomPrimaryColor(val);
-                            onApplyHeraldry({ primaryColor: val });
+                            scheduleColorHeraldry({ primaryColor: val });
                           }}
                           className="w-5 h-5 border border-[#9e7634] bg-transparent cursor-pointer"
                         />
@@ -1402,7 +1539,7 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
                           onChange={(e) => {
                             const val = e.target.value;
                             setCustomSecondaryColor(val);
-                            onApplyHeraldry({ secondaryColor: val });
+                            scheduleColorHeraldry({ secondaryColor: val });
                           }}
                           className="w-5 h-5 border border-[#9e7634] bg-transparent cursor-pointer"
                         />
@@ -1524,35 +1661,80 @@ export const ChronicleModals: React.FC<ChronicleModalsProps> = ({
                   </div>
                 </div>
 
-                <div className="p-3 rts2k-ink-well space-y-1 text-xs font-mono">
-                  <div className="text-[#c8b28e]">
-                    الأداء: <span className="text-[#6ee7b7]">{perfStats.fps} FPS</span> ·{' '}
-                    {perfStats.resolutionLabel}
+                <div className="p-3 rts2k-ink-well space-y-2 text-xs">
+                  <div className="flex items-center justify-between font-bold text-[#ffe8b3]">
+                    <span className="flex items-center gap-1.5">
+                      <Volume2 className="w-3.5 h-3.5 text-[#f59e0b]" />
+                      <span>مستوى صوت المؤثرات</span>
+                    </span>
+                    <span className="font-mono text-[#fde047]">{sfxVolume}%</span>
                   </div>
-                  <div className="text-[#fde047]">
-                    ثبات البكسل: {perfStats.worldPixelsPerMeter ?? 12} px/m
-                  </div>
-                  <div className="text-[#c8b28e]">
-                    الشبكة: {rttMs}ms · {tickRateHz}Hz
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={sfxVolume}
+                    onChange={(e) => {
+                      const next = Number(e.target.value);
+                      setSfxVolume(next);
+                      soundFx.setVolume(next / 100);
+                    }}
+                    className="w-full accent-[#d97706] cursor-pointer"
+                  />
+                  {onAdaptAllToBiomes && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onAdaptAllToBiomes();
+                        onClose();
+                      }}
+                      className="w-full py-1.5 px-2 rts2k-bevel-btn-emerald text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>تكييف كل المباني مع بيئاتها (+45%)</span>
+                    </button>
+                  )}
+                  <div className="font-mono text-[10px] text-[#c8b28e] pt-0.5">
+                    {perfStats.fps} FPS · {rttMs}ms · {tickRateHz}Hz
                   </div>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between pt-2 border-t border-[#5c4320]">
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#5c4320]">
                 <span className="text-xs text-[#c8b28e]">
                   إعادة تهيئة الخريطة بالكامل وإعادة توزيع الحواضر والحصون:
                 </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onResetWorld();
-                    onClose();
-                  }}
-                  className="px-3 py-1.5 rts2k-bevel-btn-crimson text-xs font-bold flex items-center gap-1.5 cursor-pointer"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>إعادة تهيئة العالم</span>
-                </button>
+                {!confirmReset ? (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmReset(true)}
+                    className="px-3 py-1.5 rts2k-bevel-btn-crimson text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>إعادة تهيئة العالم</span>
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmReset(false);
+                        onResetWorld();
+                        onClose();
+                      }}
+                      className="px-3 py-1.5 bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold cursor-pointer"
+                    >
+                      تأكيد إعادة التهيئة الآن
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmReset(false)}
+                      className="px-3 py-1.5 rts2k-bevel-btn text-xs font-bold cursor-pointer"
+                    >
+                      إلغاء
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           )}

@@ -4,17 +4,27 @@ import {
   CameraTransform,
   CombatEvent,
   CultureKind,
+  DiplomacyRelation,
   MarchWaypoint,
-  PveDifficulty,
-  PveTheaterState,
+  MatchStatusState,
   NetworkPacket,
   PacketLogEntry,
   PacketType,
+  PveDifficulty,
+  PveTheaterState,
   StructureKind,
   UnitKind,
+  WorldDirectorConfig,
   WorldState,
 } from '../shared/protocol';
 import { ClimateKind, WORLD_MAP_SIZE } from '../shared/worldMap';
+
+export interface MatchOutcomeEvent {
+  outcome: 'victory' | 'defeat';
+  winnerPlayerId?: string;
+  winnerNameAr?: string;
+  reasonAr?: string;
+}
 
 interface UseMultiplayerOptions {
   clientLabel?: string;
@@ -31,10 +41,7 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
   const [worldState, setWorldState] = useState<WorldState | null>(null);
   const [packetLogs, setPacketLogs] = useState<PacketLogEntry[]>([]);
   const [lastAckMessage, setLastAckMessage] = useState<string>('جاهز للاتصال بالخادم...');
-  const [bytesPerSec, setBytesPerSec] = useState<{ inBps: number; outBps: number }>({
-    inBps: 0,
-    outBps: 0,
-  });
+  const [matchEvent, setMatchEvent] = useState<MatchOutcomeEvent | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const seqRef = useRef<number>(1);
@@ -42,6 +49,10 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
   const worldRef = useRef<WorldState | null>(null);
   const bytesAccRef = useRef<{ inBytes: number; outBytes: number }>({ inBytes: 0, outBytes: 0 });
   const lastCameraSyncRef = useRef<number>(0);
+
+  const clearMatchEvent = useCallback(() => {
+    setMatchEvent(null);
+  }, []);
 
   const appendPacketLog = useCallback(
     (direction: 'IN' | 'OUT', pkt: NetworkPacket<unknown>, rawBytes: number, summary: string) => {
@@ -91,7 +102,6 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
 
     let reconnectTimer: number | undefined;
     let pingTimer: number | undefined;
-    let bwTimer: number | undefined;
     let uiFlushTimer: number | undefined;
     let lastUiStateCommitMs = 0;
     let isUnmounted = false;
@@ -117,10 +127,24 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
       }
     };
 
+    const sessionStorageKey = clientLabel
+      ? `thar_ahmed_session_token_${clientLabel}`
+      : 'thar_ahmed_session_token_v1';
+
     function connect() {
       if (isUnmounted) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      const params = new URLSearchParams();
+      try {
+        const savedToken = window.sessionStorage.getItem(sessionStorageKey);
+        if (savedToken) params.set('sessionToken', savedToken);
+        const savedAdminKey = window.sessionStorage.getItem('thar_ahmed_admin_key_v1');
+        if (savedAdminKey) params.set('adminKey', savedAdminKey);
+      } catch {
+        // Ignore sessionStorage restriction
+      }
+      const queryStr = params.toString();
+      const wsUrl = `${protocol}//${window.location.host}/ws${queryStr ? `?${queryStr}` : ''}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -143,6 +167,15 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
           switch (pkt.type) {
             case 'S2C_WELCOME': {
               const pid = String(pkt.payload.playerId);
+              const nextToken =
+                typeof pkt.payload.sessionToken === 'string' ? pkt.payload.sessionToken : '';
+              if (nextToken) {
+                try {
+                  window.sessionStorage.setItem(sessionStorageKey, nextToken);
+                } catch {
+                  // Ignore storage restriction
+                }
+              }
               const rate = Number(pkt.payload.tickRateHz || 20);
               const rawWorld = (pkt.payload.world || {}) as Partial<WorldState>;
               const world: WorldState = {
@@ -160,6 +193,9 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
                 resourceNodes: rawWorld.resourceNodes ?? {},
                 pveTheater: rawWorld.pveTheater,
                 combatEvents: rawWorld.combatEvents ?? [],
+                diplomacy: rawWorld.diplomacy ?? {},
+                directorConfig: rawWorld.directorConfig,
+                matchStatus: rawWorld.matchStatus,
               };
               setPlayerId(pid);
               setTickRateHz(rate);
@@ -187,6 +223,9 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
                 resourceNodes: rawWorld.resourceNodes ?? {},
                 pveTheater: rawWorld.pveTheater,
                 combatEvents: rawWorld.combatEvents ?? [],
+                diplomacy: rawWorld.diplomacy ?? {},
+                directorConfig: rawWorld.directorConfig,
+                matchStatus: rawWorld.matchStatus,
               };
               const reason = String(pkt.payload.reason || 'تحديث شامل للخريطة');
               worldRef.current = world;
@@ -229,12 +268,22 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
                 pveTheater:
                   (pkt.payload.pveTheater as PveTheaterState | undefined) ?? prevWorld?.pveTheater,
                 combatEvents: (pkt.payload.combatEvents as CombatEvent[] | undefined) ?? [],
+                diplomacy:
+                  (pkt.payload.diplomacy as Record<string, DiplomacyRelation> | undefined) ??
+                  prevWorld?.diplomacy,
+                directorConfig:
+                  (pkt.payload.directorConfig as WorldDirectorConfig | undefined) ??
+                  prevWorld?.directorConfig,
+                matchStatus:
+                  (pkt.payload.matchStatus as MatchStatusState | undefined) ??
+                  prevWorld?.matchStatus,
               };
               worldRef.current = nextWorld;
               const hasImportantUiChange =
                 Boolean(pkt.payload.structures) ||
                 (nextWorld.combatEvents?.length ?? 0) > 0 ||
                 nextWorld.climate !== prevWorld?.climate ||
+                nextWorld.matchStatus?.status !== prevWorld?.matchStatus?.status ||
                 Object.keys(nextWorld.players).length !== Object.keys(prevWorld?.players ?? {}).length;
               commitWorldStateToUi(nextWorld, hasImportantUiChange);
               appendPacketLog(
@@ -243,6 +292,25 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
                 raw.length,
                 `تحديث مضغوط Tick #${nextWorld.tick} (${raw.length} بايت)`
               );
+              break;
+            }
+
+            case 'S2C_MATCH_EVENT': {
+              const outcome = pkt.payload.outcome === 'victory' ? 'victory' : 'defeat';
+              setMatchEvent({
+                outcome,
+                winnerPlayerId:
+                  typeof pkt.payload.winnerPlayerId === 'string'
+                    ? pkt.payload.winnerPlayerId
+                    : undefined,
+                winnerNameAr:
+                  typeof pkt.payload.winnerNameAr === 'string'
+                    ? pkt.payload.winnerNameAr
+                    : undefined,
+                reasonAr:
+                  typeof pkt.payload.reasonAr === 'string' ? pkt.payload.reasonAr : undefined,
+              });
+              appendPacketLog('IN', pkt, raw.length, `نتيجة المعركة: ${outcome}`);
               break;
             }
 
@@ -285,20 +353,10 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
       );
     }, 2000);
 
-    bwTimer = window.setInterval(() => {
-      setBytesPerSec({
-        inBps: bytesAccRef.current.inBytes,
-        outBps: bytesAccRef.current.outBytes,
-      });
-      bytesAccRef.current.inBytes = 0;
-      bytesAccRef.current.outBytes = 0;
-    }, 1000);
-
     return () => {
       isUnmounted = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (pingTimer) clearInterval(pingTimer);
-      if (bwTimer) clearInterval(bwTimer);
       if (uiFlushTimer) clearTimeout(uiFlushTimer);
       if (wsRef.current) {
         wsRef.current.close();
@@ -477,29 +535,57 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
 
   const hydrateFromCloud = useCallback(
     (payload: {
+      idToken?: string;
       displayName: string;
       factionName?: string;
       primaryColor?: string;
       secondaryColor?: string;
       bannerPattern?: BannerPatternKind;
       culture?: CultureKind;
-      resources: {
-        wood: number;
-        stone: number;
-        gold: number;
-        food: number;
-        cloth?: number;
-        horses?: number;
-      };
-      structures: unknown[];
-      units: unknown[];
-      camera?: CameraTransform;
     }) => {
       sendPacket(
         'C2S_HYDRATE_FROM_CLOUD',
         payload,
         `مزامنة قاعدة ${payload.displayName} من الحفظ السحابي`
       );
+    },
+    [sendPacket]
+  );
+
+  const demolishStructure = useCallback(
+    (structureId: string) => {
+      sendPacket('C2S_DEMOLISH_STRUCTURE', { structureId }, `هدم المبنى (${structureId})`);
+    },
+    [sendPacket]
+  );
+
+  const queueUnit = useCallback(
+    (unitKind: UnitKind, campId?: string) => {
+      sendPacket('C2S_QUEUE_UNIT', { unitKind, campId }, `إضافة ${unitKind} لطابور التدريب`);
+    },
+    [sendPacket]
+  );
+
+  const cancelTraining = useCallback(
+    (itemId: string) => {
+      sendPacket('C2S_CANCEL_TRAINING', { itemId }, `إلغاء تدريب وحدة`);
+    },
+    [sendPacket]
+  );
+
+  const sendDiplomacyAction = useCallback(
+    (
+      targetId: string,
+      action: 'declare_war' | 'propose_ally' | 'accept_ally' | 'break_ally' | 'set_neutral'
+    ) => {
+      sendPacket('C2S_DIPLOMACY_ACTION', { targetId, action }, `إجراء دبلوماسي (${action})`);
+    },
+    [sendPacket]
+  );
+
+  const claimRole = useCallback(
+    (role: 'sultan_hassan') => {
+      sendPacket('C2S_CLAIM_ROLE', { role }, 'طلب تولي عرش السلطان حسن');
     },
     [sendPacket]
   );
@@ -576,19 +662,25 @@ export function useMultiplayerClient(options: UseMultiplayerOptions = {}) {
     worldRef,
     packetLogs,
     lastAckMessage,
-    bytesPerSec,
+    matchEvent,
+    clearMatchEvent,
     syncCamera,
     placeStructure,
     placeFortBatch,
+    demolishStructure,
     setCulture,
     upgradeStructure,
     spawnUnit,
+    queueUnit,
+    cancelTraining,
     moveUnits,
     attackTarget,
     setUnitStance,
     repairStructure,
     toggleGate,
     deployPveFronts,
+    sendDiplomacyAction,
+    claimRole,
     reclaimKeep,
     dispatchAtlasMarch,
     tradeResource,

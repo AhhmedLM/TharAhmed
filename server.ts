@@ -1,11 +1,13 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
-import { createServer } from 'http';
+import fs from 'fs';
+import { createServer, type IncomingMessage } from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, WebSocket } from 'ws';
-import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
+import { requireAdmin, requireAuth, verifyFirebaseBearer, type AuthRequest } from './src/middleware/auth.ts';
 import {
   deleteKingdomByUid,
   loadAllResourceDeltas,
@@ -31,6 +33,7 @@ import {
   getStructureUpgradeRequirement,
   getTotalCarriedLoot,
   getUnitEffectiveCombatStats,
+  getUnitTrainingDurationSeconds,
   MAX_CAMERA_ZOOM,
   MIN_CAMERA_ZOOM,
   normalizeCultureKind,
@@ -47,17 +50,22 @@ import type {
   BlockoutUnit,
   CombatEvent,
   CultureKind,
+  DiplomacyRelation,
   MarchWaypoint,
+  MatchStatusState,
   NetworkPacket,
   PlayerResources,
   PlayerState,
   PveDifficulty,
-  PveTheaterState,
+  PvpMode,
   ResourceNode,
   StructureKind,
   StructureLevel,
+  SultanHassanMode,
+  TrainingQueueItem,
   UnitKind,
   UnitStanceKind,
+  WorldDirectorConfig,
   WorldState,
 } from './src/shared/protocol.ts';
 import {
@@ -189,6 +197,86 @@ function quantize(val: number): number {
   return Math.round(val * 10) / 10;
 }
 
+function isFiniteNum(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function clampCoord(v: number): number {
+  return Math.max(-WORLD_HALF_SIZE + 4, Math.min(WORLD_HALF_SIZE - 4, quantize(v)));
+}
+
+const DIRECTOR_CONFIG_PATH = path.join(__dirname, 'data', 'director-config.json');
+
+function createDefaultDirectorConfig(): WorldDirectorConfig {
+  const enabledCities: Record<string, boolean> = {};
+  for (const p of AI_KINGDOM_PRESETS) {
+    enabledCities[p.id] = true;
+  }
+  return {
+    pvpMode: 'diplomacy',
+    sultanHassanMode: 'ai_ruler',
+    sultanHassanAssignedUid: null,
+    enabledCities,
+    banditsEnabled: true,
+    banditDifficulty: 'balanced',
+    banditCampCount: 3,
+    dominionVictoryTargetCities: 6,
+  };
+}
+
+function loadDirectorConfig(): WorldDirectorConfig {
+  const def = createDefaultDirectorConfig();
+  try {
+    if (!fs.existsSync(DIRECTOR_CONFIG_PATH)) return def;
+    const raw = JSON.parse(fs.readFileSync(DIRECTOR_CONFIG_PATH, 'utf8')) as Partial<WorldDirectorConfig>;
+    const pvpMode: PvpMode =
+      raw.pvpMode === 'free_for_all' || raw.pvpMode === 'coop' ? raw.pvpMode : 'diplomacy';
+    const sultanHassanMode: SultanHassanMode =
+      raw.sultanHassanMode === 'human_claimable' || raw.sultanHassanMode === 'disabled'
+        ? raw.sultanHassanMode
+        : 'ai_ruler';
+    const banditDifficulty: PveDifficulty =
+      raw.banditDifficulty === 'casual' || raw.banditDifficulty === 'aggressive'
+        ? raw.banditDifficulty
+        : 'balanced';
+    const mergedCities = { ...def.enabledCities };
+    if (raw.enabledCities && typeof raw.enabledCities === 'object') {
+      for (const k of Object.keys(mergedCities)) {
+        if (typeof raw.enabledCities[k] === 'boolean') {
+          mergedCities[k] = raw.enabledCities[k];
+        }
+      }
+    }
+    return {
+      pvpMode,
+      sultanHassanMode,
+      sultanHassanAssignedUid:
+        typeof raw.sultanHassanAssignedUid === 'string' && raw.sultanHassanAssignedUid.trim()
+          ? raw.sultanHassanAssignedUid.trim()
+          : null,
+      enabledCities: mergedCities,
+      banditsEnabled: typeof raw.banditsEnabled === 'boolean' ? raw.banditsEnabled : true,
+      banditDifficulty,
+      banditCampCount: Math.max(1, Math.min(4, Math.round(Number(raw.banditCampCount ?? 3)))),
+      dominionVictoryTargetCities: Math.max(
+        2,
+        Math.min(12, Math.round(Number(raw.dominionVictoryTargetCities ?? 6)))
+      ),
+    };
+  } catch {
+    return def;
+  }
+}
+
+function saveDirectorConfig(cfg: WorldDirectorConfig): void {
+  try {
+    fs.mkdirSync(path.dirname(DIRECTOR_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(DIRECTOR_CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch (err) {
+    console.warn('Could not persist director-config.json:', err);
+  }
+}
+
 function createInitialResourceNodes(): Record<string, ResourceNode> {
   const nodes: Record<string, ResourceNode> = {};
   const layout: Array<{ kind: ResourceNode['kind']; x: number; z: number; amount: number }> = [];
@@ -272,10 +360,15 @@ const worldState: WorldState = {
     startedAtMs: Date.now(),
   },
   combatEvents: [],
+  diplomacy: {},
+  matchStatus: { status: 'active' },
 };
 
+const MAX_LOADED_SECTORS = 350;
+
 /**
- * Materializes deterministic procedural resource nodes on-demand for active 256m sectors.
+ * Materializes deterministic procedural resource nodes on-demand for active 256m sectors
+ * with bounded LRU sector eviction.
  */
 function ensureSectorsMaterialized(centerX: number, centerZ: number, radiusM = 1200): boolean {
   const { sx: cx, sz: cz } = getSectorCoords(centerX, centerZ);
@@ -287,7 +380,12 @@ function ensureSectorsMaterialized(centerX: number, centerZ: number, radiusM = 1
       const sx = cx + dx;
       const sz = cz + dz;
       const key = `${sx}_${sz}`;
-      if (loadedSectors.has(key)) continue;
+      if (loadedSectors.has(key)) {
+        // Refresh LRU position
+        loadedSectors.delete(key);
+        loadedSectors.add(key);
+        continue;
+      }
       loadedSectors.add(key);
 
       const sectorNodes = getDeterministicNodesInSector(sx, sz, resourceDeltasCache);
@@ -295,6 +393,34 @@ function ensureSectorsMaterialized(centerX: number, centerZ: number, radiusM = 1
         if (!worldState.resourceNodes[n.id]) {
           worldState.resourceNodes[n.id] = n;
           addedAny = true;
+        }
+      }
+    }
+  }
+
+  if (loadedSectors.size > MAX_LOADED_SECTORS) {
+    const occupiedSectors = new Set<string>();
+    for (const s of Object.values(worldState.structures)) {
+      const sc = getSectorCoords(s.x, s.z);
+      occupiedSectors.add(`${sc.sx}_${sc.sz}`);
+    }
+    for (const u of Object.values(worldState.units)) {
+      const sc = getSectorCoords(u.x, u.z);
+      occupiedSectors.add(`${sc.sx}_${sc.sz}`);
+    }
+    for (const key of Array.from(loadedSectors)) {
+      if (loadedSectors.size <= MAX_LOADED_SECTORS) break;
+      if (occupiedSectors.has(key)) continue;
+      loadedSectors.delete(key);
+      const [sxStr, szStr] = key.split('_');
+      const rsx = Number(sxStr);
+      const rsz = Number(szStr);
+      for (const rId of Object.keys(worldState.resourceNodes)) {
+        const rn = worldState.resourceNodes[rId];
+        if (rn.id.startsWith('res_')) continue; // keep canonical world starters
+        const rc = getSectorCoords(rn.x, rn.z);
+        if (rc.sx === rsx && rc.sz === rsz) {
+          delete worldState.resourceNodes[rId];
         }
       }
     }
@@ -665,11 +791,11 @@ const AI_KINGDOM_PRESETS: Array<{
   // 1. Sindhi State Provinces (ولايات الدولة السندية)
   {
     id: 'ai_sindhi_mirqab',
-    name: 'ولاية مرقاب (العاصمة)',
+    name: 'السلطان حسن — الدولة السندية (مرقاب)',
     cityNameAr: 'مرقاب',
-    administrationTitleAr: 'ديوان عاصمة الدولة السندية',
-    factionName: 'الدولة السندية — عاصمة مرقاب',
-    provinceAr: 'ولاية مرقاب — دجلة',
+    administrationTitleAr: 'بلاط السلطان حسن — عاصمة الدولة السندية',
+    factionName: 'السلطان حسن — الدولة السندية',
+    provinceAr: 'عاصمة مرقاب — دجلة',
     aiFactionKind: 'sindhi_state',
     color: '#0d9488',
     secondaryColor: '#fbbf24',
@@ -969,21 +1095,68 @@ const BANDIT_CLAN_PRESETS: Array<{
   },
 ];
 
-function isHostileOwners(ownerA: string, ownerB: string): boolean {
-  if (ownerA === ownerB) return false;
+function diplomacyKey(a: string, b: string): string {
+  return a < b ? `${a}::${b}` : `${b}::${a}`;
+}
+
+function getDiplomacyRelation(ownerA: string, ownerB: string): DiplomacyRelation {
+  if (ownerA === ownerB) return 'ally';
+  const dip = worldState.diplomacy?.[diplomacyKey(ownerA, ownerB)];
+  if (dip) return dip;
   const pA = worldState.players[ownerA];
   const pB = worldState.players[ownerB];
   const aIsAi = Boolean(pA?.isAi || pA?.isBandit);
   const bIsAi = Boolean(pB?.isAi || pB?.isBandit);
-  // Human players always cooperate in Online Co-op PvE
-  if (!aIsAi && !bIsAi) return false;
-  // Human vs any AI faction (Sindhi State, Crusaders, or Bandits) is hostile
-  if (aIsAi !== bIsAi) return true;
-  // AI vs AI: Same faction cooperates; different major factions & bandits are hostile
-  const kindA = pA?.aiFactionKind ?? (pA?.isBandit ? 'bandits' : 'sindhi_state');
-  const kindB = pB?.aiFactionKind ?? (pB?.isBandit ? 'bandits' : 'sindhi_state');
-  if (kindA === kindB) return false;
-  return true;
+  const pvpMode = worldState.directorConfig?.pvpMode ?? 'diplomacy';
+  if (!aIsAi && !bIsAi) {
+    if (pvpMode === 'coop') return 'ally';
+    if (pvpMode === 'free_for_all') return 'war';
+    return 'neutral';
+  }
+  if (pA?.isBandit || pB?.isBandit) return 'war';
+  if (aIsAi !== bIsAi) return 'war';
+  const kindA = pA?.aiFactionKind ?? 'sindhi_state';
+  const kindB = pB?.aiFactionKind ?? 'sindhi_state';
+  return kindA === kindB ? 'ally' : 'war';
+}
+
+function isHostileOwners(ownerA: string, ownerB: string): boolean {
+  if (ownerA === ownerB) return false;
+  return getDiplomacyRelation(ownerA, ownerB) === 'war';
+}
+
+const ZERO_MASKED_RESOURCES: PlayerResources = {
+  wood: 0,
+  stone: 0,
+  gold: 0,
+  food: 0,
+  cloth: 0,
+  horses: 0,
+};
+
+function sanitizePlayersForRecipient(recipientPid: string): Record<string, PlayerState> {
+  const out: Record<string, PlayerState> = {};
+  for (const [id, p] of Object.entries(worldState.players)) {
+    const isSelfOrAlly = id === recipientPid || getDiplomacyRelation(recipientPid, id) === 'ally';
+    if (isSelfOrAlly) {
+      out[id] = p;
+    } else {
+      out[id] = {
+        ...p,
+        resources: { ...ZERO_MASKED_RESOURCES },
+        trainingQueue: [],
+        camera: {
+          ...p.camera,
+          targetX: 0,
+          targetZ: 0,
+          cursorX: 0,
+          cursorZ: 0,
+        },
+        uid: undefined,
+      };
+    }
+  }
+  return out;
 }
 
 function clearSingleAiPlayer(aiId: string) {
@@ -1464,204 +1637,227 @@ function spawnSingleBanditCamp(
   return banditPlayer;
 }
 
-function spawnOrganizedAiKingdoms(difficulty: PveDifficulty) {
+function spawnSingleAiCityByPreset(
+  preset: (typeof AI_KINGDOM_PRESETS)[number],
+  difficulty: PveDifficulty
+) {
   const hpMult = difficulty === 'casual' ? 0.9 : difficulty === 'aggressive' ? 1.2 : 1.0;
 
-  for (const preset of AI_KINGDOM_PRESETS) {
-    if (worldState.players[preset.id]) {
-      clearSingleAiPlayer(preset.id);
+  if (worldState.players[preset.id]) {
+    clearSingleAiPlayer(preset.id);
+  }
+  const slot = SPAWN_PLATEAUS[preset.plateauIndex] ?? SPAWN_PLATEAUS[0];
+  const rx = slot.x;
+  const rz = slot.z;
+  const isBedouinCity = preset.culture === 'bedouin_nomadic';
+  const isWalledCity = Boolean(slot.walled) && !isBedouinCity;
+  const mainLv: StructureLevel = preset.isCapital ? 3 : 2;
+  const subLv: StructureLevel = preset.isCapital ? 2 : 1;
+  const isMirqabSultan = preset.id === 'ai_sindhi_mirqab';
+
+  const aiPlayer: PlayerState = {
+    id: preset.id,
+    name: preset.name,
+    cityNameAr: preset.cityNameAr,
+    administrationTitleAr: preset.administrationTitleAr,
+    color: preset.color,
+    secondaryColor: preset.secondaryColor,
+    bannerPattern: preset.bannerPattern,
+    factionName: preset.factionName,
+    provinceAr: preset.provinceAr,
+    aiFactionKind: preset.aiFactionKind,
+    culture: preset.culture,
+    isSultanHassan: isMirqabSultan,
+    connectedAt: Date.now(),
+    pingMs: 0,
+    camera: {
+      targetX: rx,
+      targetZ: rz,
+      zoom: 42,
+      yaw: 0,
+      pitch: 58,
+      cursorX: rx,
+      cursorZ: rz,
+    },
+    resources: {
+      wood: 950,
+      stone: 900,
+      gold: 900,
+      food: 850,
+      cloth: 500,
+      horses: 400,
+    },
+    packetsReceived: 0,
+    packetsSent: 0,
+    isAi: true,
+    isBandit: false,
+    isDefeated: false,
+    defeatedAtMs: undefined,
+    aiDifficulty: difficulty,
+    kills: 0,
+    losses: 0,
+    structuresRazed: 0,
+  };
+
+  worldState.players[preset.id] = aiPlayer;
+  ensureSectorsMaterialized(rx, rz, 768);
+
+  const blueprint = getBespokeCityBlueprintById(preset.id);
+  let cityLayout: PlannedCityBuilding[];
+  if (blueprint) {
+    cityLayout = blueprint.buildings;
+  } else {
+    const housingKind: StructureKind = isBedouinCity ? 'bedouin_tent' : 'house';
+    cityLayout = [
+      { kind: 'keep', level: mainLv, dx: 0, dz: 0, rot: 0, exact: true },
+      { kind: 'temple', level: mainLv, dx: -10, dz: -10, rot: 0 },
+      { kind: 'market', level: mainLv, dx: 10, dz: -10, rot: 0 },
+      { kind: housingKind, level: mainLv, dx: -10.5, dz: 4.5, rot: 0 },
+      { kind: housingKind, level: mainLv, dx: -10.5, dz: 11.5, rot: Math.PI / 2 },
+      { kind: housingKind, level: subLv, dx: 10.5, dz: 11.5, rot: -Math.PI / 2 },
+      { kind: 'barracks', level: mainLv, dx: 10.5, dz: 4.5, rot: 0 },
+      { kind: 'farm', level: subLv, dx: -27.5, dz: -4.5, rot: 0 },
+    ];
+    if (!isWalledCity) {
+      cityLayout.push(
+        { kind: 'watchtower', level: 2, dx: 0, dz: 16, rot: 0, exact: true },
+        { kind: 'war_tent', level: 2, dx: 12.5, dz: -4.5, rot: 0 }
+      );
     }
-    const slot = SPAWN_PLATEAUS[preset.plateauIndex] ?? SPAWN_PLATEAUS[0];
-    const rx = slot.x;
-    const rz = slot.z;
-    const isBedouinCity = preset.culture === 'bedouin_nomadic';
-    const isWalledCity = Boolean(slot.walled) && !isBedouinCity;
-    const mainLv: StructureLevel = preset.isCapital ? 3 : 2;
-    const subLv: StructureLevel = preset.isCapital ? 2 : 1;
+  }
 
-    const aiPlayer: PlayerState = {
-      id: preset.id,
-      name: preset.name,
-      cityNameAr: preset.cityNameAr,
-      administrationTitleAr: preset.administrationTitleAr,
-      color: preset.color,
-      secondaryColor: preset.secondaryColor,
-      bannerPattern: preset.bannerPattern,
-      factionName: preset.factionName,
-      provinceAr: preset.provinceAr,
-      aiFactionKind: preset.aiFactionKind,
-      culture: preset.culture,
-      connectedAt: Date.now(),
-      pingMs: 0,
-      camera: {
-        targetX: rx,
-        targetZ: rz,
-        zoom: 42,
-        yaw: 0,
-        pitch: 58,
-        cursorX: rx,
-        cursorZ: rz,
-      },
-      resources: {
-        wood: 950,
-        stone: 900,
-        gold: 900,
-        food: 850,
-        cloth: 500,
-        horses: 400,
-      },
-      packetsReceived: 0,
-      packetsSent: 0,
-      isAi: true,
-      isBandit: false,
-      isDefeated: false,
-      defeatedAtMs: undefined,
-      aiDifficulty: difficulty,
-      kills: 0,
-      losses: 0,
-      structuresRazed: 0,
-    };
-
-    worldState.players[preset.id] = aiPlayer;
-    ensureSectorsMaterialized(rx, rz, 768);
-
-    const blueprint = getBespokeCityBlueprintById(preset.id);
-
-    let cityLayout: PlannedCityBuilding[];
-    if (blueprint) {
-      cityLayout = blueprint.buildings;
-    } else {
-      // Fallback compact layout only if a future preset has no bespoke blueprint
-      const housingKind: StructureKind = isBedouinCity ? 'bedouin_tent' : 'house';
-      cityLayout = [
-        { kind: 'keep', level: mainLv, dx: 0, dz: 0, rot: 0, exact: true },
-        { kind: 'temple', level: mainLv, dx: -10, dz: -10, rot: 0 },
-        { kind: 'market', level: mainLv, dx: 10, dz: -10, rot: 0 },
-        { kind: housingKind, level: mainLv, dx: -10.5, dz: 4.5, rot: 0 },
-        { kind: housingKind, level: mainLv, dx: -10.5, dz: 11.5, rot: Math.PI / 2 },
-        { kind: housingKind, level: subLv, dx: 10.5, dz: 11.5, rot: -Math.PI / 2 },
-        { kind: 'barracks', level: mainLv, dx: 10.5, dz: 4.5, rot: 0 },
-        { kind: 'farm', level: subLv, dx: -27.5, dz: -4.5, rot: 0 },
-      ];
-      if (!isWalledCity) {
-        cityLayout.push(
-          { kind: 'watchtower', level: 2, dx: 0, dz: 16, rot: 0, exact: true },
-          { kind: 'war_tent', level: 2, dx: 12.5, dz: -4.5, rot: 0 }
-        );
-      }
-    }
-
-    cityLayout.forEach((b) => {
-      let pos: { x: number; z: number } | null = null;
-      if (b.exact) {
-        const tx = quantize(rx + b.dx);
-        const tz = quantize(rz + b.dz);
-        const terrainCheck = isBuildableTerrain(tx, tz);
-        if (terrainCheck.ok) {
+  cityLayout.forEach((b) => {
+    let pos: { x: number; z: number } | null = null;
+    if (b.exact) {
+      const tx = quantize(rx + b.dx);
+      const tz = quantize(rz + b.dz);
+      const terrainCheck = isBuildableTerrain(tx, tz);
+      if (terrainCheck.ok) {
+        pos = { x: tx, z: tz };
+      } else if (
+        b.kind === 'moat_trench' ||
+        b.kind === 'stone_wall' ||
+        b.kind === 'watchtower' ||
+        b.kind === 'gatehouse'
+      ) {
+        const h = getTerrainHeight(tx, tz);
+        if (h >= WATER_LEVEL_Y - 0.9) {
           pos = { x: tx, z: tz };
-        } else if (
-          b.kind === 'moat_trench' ||
-          b.kind === 'stone_wall' ||
-          b.kind === 'watchtower' ||
-          b.kind === 'gatehouse'
-        ) {
-          // Allow coastal/harbor fortifications and moats on shallow edges without dropping wall continuity
-          const h = getTerrainHeight(tx, tz);
-          if (h >= WATER_LEVEL_Y - 0.9) {
-            pos = { x: tx, z: tz };
-          }
         }
-      } else {
-        pos = findValidPlacementNear(rx, rz, b.dx, b.dz, 3.25);
       }
-      if (!pos) return;
-      const id = nextEntityId('str');
-      const spec = STRUCTURE_SPECS[b.kind];
-      const lvMult = b.level === 3 ? 2.1 : b.level === 2 ? 1.45 : 1.0;
-      const fortTerrain = evaluateFortificationTerrain(pos.x, pos.z);
-      const maxHp = Math.round(spec.maxHp * lvMult * hpMult);
-      worldState.structures[id] = {
-        id,
-        ownerId: aiPlayer.id,
-        ownerColor: aiPlayer.color,
-        secondaryColor: aiPlayer.secondaryColor,
-        bannerPattern: aiPlayer.bannerPattern,
-        kind: b.kind,
-        culture: preset.culture,
-        level: b.level,
-        x: pos.x,
-        z: pos.z,
-        rotationY: b.rot,
-        hp: maxHp,
-        maxHp,
-        createdAtTick: worldState.tick,
-        ...(b.kind === 'gatehouse' ? { isGateLocked: false } : {}),
-        ...(b.kind === 'moat_trench' ? { isWaterMoat: fortTerrain.isWaterFedMoat } : {}),
-      };
-    });
+    } else {
+      pos = findValidPlacementNear(rx, rz, b.dx, b.dz, 3.25);
+    }
+    if (!pos) return;
+    const id = nextEntityId('str');
+    const spec = STRUCTURE_SPECS[b.kind];
+    const lvMult = b.level === 3 ? 2.1 : b.level === 2 ? 1.45 : 1.0;
+    const fortTerrain = evaluateFortificationTerrain(pos.x, pos.z);
+    const maxHp = Math.round(spec.maxHp * lvMult * hpMult);
+    worldState.structures[id] = {
+      id,
+      ownerId: aiPlayer.id,
+      ownerColor: aiPlayer.color,
+      secondaryColor: aiPlayer.secondaryColor,
+      bannerPattern: aiPlayer.bannerPattern,
+      kind: b.kind,
+      culture: preset.culture,
+      level: b.level,
+      x: pos.x,
+      z: pos.z,
+      rotationY: b.rot,
+      hp: maxHp,
+      maxHp,
+      createdAtTick: worldState.tick,
+      ...(b.kind === 'gatehouse' ? { isGateLocked: false } : {}),
+      ...(b.kind === 'moat_trench' ? { isWaterMoat: fortTerrain.isWaterFedMoat } : {}),
+    };
+  });
 
-    const garrisonKinds: UnitKind[] = blueprint
-      ? blueprint.garrison
-      : preset.isCapital
-        ? ['worker', 'worker', 'commander', 'knight', 'knight', 'infantry', 'infantry', 'spearman', 'archer', 'archer']
-        : ['worker', 'knight', 'infantry', 'spearman', 'archer', 'archer'];
+  const garrisonKinds: UnitKind[] = blueprint
+    ? blueprint.garrison
+    : preset.isCapital
+      ? ['worker', 'worker', 'commander', 'knight', 'knight', 'infantry', 'infantry', 'spearman', 'archer', 'archer']
+      : ['worker', 'knight', 'infantry', 'spearman', 'archer', 'archer'];
 
-    const hotspots = blueprint?.hotspots ?? [];
-    const gateSpots = hotspots.filter((h) => h.kind === 'gate' || h.kind === 'harbor');
-    const civicSpots = hotspots.filter((h) => h.kind === 'plaza' || h.kind === 'souq' || h.kind === 'mosque');
+  const gateBuildings = cityLayout.filter((b) => b.kind === 'gatehouse');
+  const civicBuildings = cityLayout.filter(
+    (b) => b.kind === 'market' || b.kind === 'temple' || b.kind === 'keep'
+  );
 
-    garrisonKinds.forEach((uk, idx) => {
-      let ux: number;
-      let uz: number;
-      let ang = (idx / Math.max(1, garrisonKinds.length)) * Math.PI * 2;
+  let assignedHeroSultan = false;
+  garrisonKinds.forEach((uk, idx) => {
+    let ux: number;
+    let uz: number;
+    let ang = (idx / Math.max(1, garrisonKinds.length)) * Math.PI * 2;
 
-      if (uk === 'worker' && civicSpots.length > 0) {
-        const spot = civicSpots[idx % civicSpots.length];
-        const a = ((idx * 1.9) % (Math.PI * 2));
-        ux = quantize(rx + spot.x + Math.cos(a) * Math.min(4.2, spot.radius * 0.45));
-        uz = quantize(rz + spot.z + Math.sin(a) * Math.min(4.2, spot.radius * 0.45));
-        ang = a;
-      } else if ((uk === 'spearman' || uk === 'archer' || uk === 'infantry') && gateSpots.length > 0) {
-        const spot = gateSpots[idx % gateSpots.length];
-        const a = ((idx * 2.3) % (Math.PI * 2));
-        ux = quantize(rx + spot.x * 0.88 + Math.cos(a) * 2.4);
-        uz = quantize(rz + spot.z * 0.88 + Math.sin(a) * 2.4);
-        ang = Math.atan2(spot.z, spot.x);
-      } else {
-        const rad = uk === 'worker' ? 8 : uk === 'commander' ? 6.5 : 15;
-        ux = quantize(rx + Math.cos(ang) * rad);
-        uz = quantize(rz + Math.sin(ang) * rad);
-      }
+    if (uk === 'worker' && civicBuildings.length > 0) {
+      const spot = civicBuildings[idx % civicBuildings.length];
+      const a = (idx * 1.9) % (Math.PI * 2);
+      ux = quantize(rx + spot.dx + Math.cos(a) * 3.8);
+      uz = quantize(rz + spot.dz + Math.sin(a) * 3.8);
+      ang = a;
+    } else if ((uk === 'spearman' || uk === 'archer' || uk === 'infantry') && gateBuildings.length > 0) {
+      const spot = gateBuildings[idx % gateBuildings.length];
+      const a = (idx * 2.3) % (Math.PI * 2);
+      ux = quantize(rx + spot.dx * 0.9 + Math.cos(a) * 2.5);
+      uz = quantize(rz + spot.dz * 0.9 + Math.sin(a) * 2.5);
+      ang = Math.atan2(spot.dz, spot.dx);
+    } else {
+      const rad = uk === 'worker' ? 8 : uk === 'commander' ? 6.5 : 15;
+      ux = quantize(rx + Math.cos(ang) * rad);
+      uz = quantize(rz + Math.sin(ang) * rad);
+    }
 
-      const uSpec = UNIT_SPECS[uk];
-      const uid = nextEntityId('unt');
-      worldState.units[uid] = {
-        id: uid,
-        ownerId: aiPlayer.id,
-        ownerColor: aiPlayer.color,
-        secondaryColor: aiPlayer.secondaryColor,
-        bannerPattern: aiPlayer.bannerPattern,
-        kind: uk,
-        x: ux,
-        z: uz,
-        targetX: ux,
-        targetZ: uz,
-        rotationY: ang,
-        speed: uSpec.speed,
-        state: 'idle',
-        stance: 'defensive',
-        activityAr:
-          uk === 'worker'
-            ? `يعمر ${preset.cityNameAr}`
-            : preset.aiFactionKind === 'crusaders'
-              ? `حامية ${preset.cityNameAr} الساحلية`
-              : `حامية ${preset.cityNameAr}`,
-        patrolling: false,
-        hp: uSpec.maxHp,
-        maxHp: uSpec.maxHp,
-        isBanditUnit: false,
-      };
-    });
+    const uSpec = UNIT_SPECS[uk];
+    const uid = nextEntityId('unt');
+    const makeHero = isMirqabSultan && uk === 'commander' && !assignedHeroSultan;
+    if (makeHero) assignedHeroSultan = true;
+    const finalHp = makeHero ? Math.round(uSpec.maxHp * 1.65) : uSpec.maxHp;
+
+    worldState.units[uid] = {
+      id: uid,
+      ownerId: aiPlayer.id,
+      ownerColor: aiPlayer.color,
+      secondaryColor: aiPlayer.secondaryColor,
+      bannerPattern: aiPlayer.bannerPattern,
+      kind: uk,
+      x: ux,
+      z: uz,
+      targetX: ux,
+      targetZ: uz,
+      rotationY: ang,
+      speed: makeHero ? Math.round(uSpec.speed * 1.15 * 10) / 10 : uSpec.speed,
+      state: 'idle',
+      stance: 'defensive',
+      activityAr: makeHero
+        ? 'السلطان حسن يقود جند الدولة السندية في مرقاب'
+        : uk === 'worker'
+          ? `يعمر ${preset.cityNameAr}`
+          : preset.aiFactionKind === 'crusaders'
+            ? `حامية ${preset.cityNameAr} الحصينة`
+            : `جند الدولة السندية — حامية ${preset.cityNameAr}`,
+      patrolling: false,
+      hp: finalHp,
+      maxHp: finalHp,
+      isBanditUnit: false,
+      ...(makeHero ? { isHeroSultan: true } : {}),
+    };
+  });
+}
+
+function spawnOrganizedAiKingdoms(difficulty: PveDifficulty) {
+  const cfg = worldState.directorConfig;
+  for (const preset of AI_KINGDOM_PRESETS) {
+    if (cfg && cfg.enabledCities[preset.id] === false) {
+      if (worldState.players[preset.id]) clearSingleAiPlayer(preset.id);
+      continue;
+    }
+    if (preset.id === 'ai_sindhi_mirqab' && cfg?.sultanHassanMode === 'disabled') {
+      if (worldState.players[preset.id]) clearSingleAiPlayer(preset.id);
+      continue;
+    }
+    spawnSingleAiCityByPreset(preset, difficulty);
   }
   structuresDirty = true;
 }
@@ -1699,9 +1895,23 @@ function spawnBanditClans(
   structuresDirty = true;
 }
 
-// Boot 1080 AD PvE World: Organized AI Provinces (Sindhi State & Coastal Crusaders) + Bandit Lairs near Hisn al-Quful
-spawnOrganizedAiKingdoms('balanced');
-spawnBanditClans('balanced', 3, SPAWN_PLATEAUS[4].x, SPAWN_PLATEAUS[4].z);
+// Boot 1080 AD World: Director Config + Organized AI Provinces (Sultan Hassan in Mirqab & Al-Quds) + Bandits
+worldState.directorConfig = loadDirectorConfig();
+spawnOrganizedAiKingdoms(worldState.directorConfig.banditDifficulty);
+if (worldState.directorConfig.banditsEnabled) {
+  spawnBanditClans(
+    worldState.directorConfig.banditDifficulty,
+    worldState.directorConfig.banditCampCount,
+    SPAWN_PLATEAUS[4].x,
+    SPAWN_PLATEAUS[4].z
+  );
+} else {
+  clearAiPlayers(true);
+}
+if (worldState.pveTheater) {
+  worldState.pveTheater.difficulty = worldState.directorConfig.banditDifficulty;
+  worldState.pveTheater.strongholdCount = worldState.directorConfig.banditCampCount;
+}
 
 function canAfford(resources: PlayerResources, cost: Partial<PlayerResources>): boolean {
   return (
@@ -1725,12 +1935,91 @@ function deductResources(resources: PlayerResources, cost: Partial<PlayerResourc
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '4mb' }));
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
+
+  const apiRateMap = new Map<string, { count: number; resetAt: number }>();
+  app.use('/api', (req, res, next) => {
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    let entry = apiRateMap.get(ip);
+    if (!entry || now >= entry.resetAt) {
+      entry = { count: 0, resetAt: now + 60_000 };
+      if (apiRateMap.size > 4000) {
+        const firstKey = apiRateMap.keys().next().value;
+        if (firstKey !== undefined) apiRateMap.delete(firstKey);
+      }
+      apiRateMap.set(ip, entry);
+    }
+    entry.count += 1;
+    if (entry.count > 120) {
+      res.status(429).json({ error: 'Too many requests, please slow down.' });
+      return;
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: '1mb' }));
+
+  const allowedOriginsSet = new Set(
+    (process.env.ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  const isAllowedWsOrigin = (req: IncomingMessage): boolean => {
+    const origin = req.headers.origin;
+    if (!origin) return true;
+    try {
+      const parsed = new URL(origin);
+      const hostHeader = String(req.headers.host || '').toLowerCase();
+      if (parsed.host.toLowerCase() === hostHeader) return true;
+      if (
+        parsed.hostname === 'localhost' ||
+        parsed.hostname === '127.0.0.1' ||
+        parsed.hostname === '[::1]'
+      ) {
+        return true;
+      }
+      if (allowedOriginsSet.has(origin.toLowerCase())) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  };
 
   const httpServer = createServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: '/ws',
+    maxPayload: 128 * 1024,
+    verifyClient: (info, done) => {
+      if (!isAllowedWsOrigin(info.req)) {
+        done(false, 403, 'Forbidden origin');
+        return;
+      }
+      done(true);
+    },
+  });
 
   const clientSockets = new Map<string, WebSocket>();
+  const socketAdminMap = new WeakMap<WebSocket, boolean>();
+  const socketTokenMap = new WeakMap<WebSocket, string>();
+  const sessionGraceMap = new Map<
+    string,
+    { playerId: string; uid?: string; timer: NodeJS.Timeout }
+  >();
+
+  function isSocketAdmin(ws: WebSocket): boolean {
+    return Boolean(socketAdminMap.get(ws));
+  }
 
   function sendPacket<T>(ws: WebSocket, type: NetworkPacket['type'], payload: T) {
     if (ws.readyState !== WebSocket.OPEN) return;
@@ -1752,6 +2041,7 @@ async function startServer() {
         reason,
         world: {
           ...worldState,
+          players: sanitizePlayersForRecipient(pid),
           structures: slice.structures ?? {},
           units: slice.units,
           resourceNodes: slice.resourceNodes ?? {},
@@ -1762,6 +2052,98 @@ async function startServer() {
         worldState.players[pid].packetsSent += 1;
       }
     }
+  }
+
+  function transferSultanHassanToHuman(targetPlayerId: string): { ok: boolean; message: string } {
+    const target = worldState.players[targetPlayerId];
+    if (!target || target.isAi || target.isBandit) {
+      return { ok: false, message: 'اللاعب المستهدف غير موجود' };
+    }
+    const mirqabId = 'ai_sindhi_mirqab';
+    if (worldState.players[mirqabId]) {
+      for (const st of Object.values(worldState.structures)) {
+        if (st.ownerId === mirqabId) {
+          st.ownerId = target.id;
+          st.ownerColor = target.color;
+          st.secondaryColor = target.secondaryColor;
+          st.bannerPattern = target.bannerPattern;
+        }
+      }
+      for (const u of Object.values(worldState.units)) {
+        if (u.ownerId === mirqabId) {
+          u.ownerId = target.id;
+          u.ownerColor = target.color;
+          u.secondaryColor = target.secondaryColor;
+          u.bannerPattern = target.bannerPattern;
+        }
+      }
+      clearSingleAiPlayer(mirqabId);
+    }
+    for (const p of Object.values(worldState.players)) {
+      if (p.id !== target.id && p.isSultanHassan) p.isSultanHassan = false;
+    }
+    target.isSultanHassan = true;
+    target.factionName = `السلطان حسن (${target.name}) — الدولة السندية`;
+    if (worldState.directorConfig) {
+      worldState.directorConfig.sultanHassanAssignedUid = target.uid ?? target.id;
+      saveDirectorConfig(worldState.directorConfig);
+    }
+    structuresDirty = true;
+    return { ok: true, message: `تولّى ${target.name} قيادة السلطان حسن وعاصمة مرقاب` };
+  }
+
+  function applyDirectorConfigLive(nextCfg: WorldDirectorConfig): void {
+    const prevCfg = worldState.directorConfig ?? createDefaultDirectorConfig();
+    worldState.directorConfig = nextCfg;
+    saveDirectorConfig(nextCfg);
+
+    for (const preset of AI_KINGDOM_PRESETS) {
+      const enabled = nextCfg.enabledCities[preset.id] !== false;
+      const isMirqabBlocked =
+        preset.id === 'ai_sindhi_mirqab' && nextCfg.sultanHassanMode === 'disabled';
+      const humanHoldsMirqab =
+        preset.id === 'ai_sindhi_mirqab' &&
+        Object.values(worldState.players).some((p) => !p.isAi && p.isSultanHassan);
+
+      if (!enabled || isMirqabBlocked) {
+        if (worldState.players[preset.id]) clearSingleAiPlayer(preset.id);
+        if (isMirqabBlocked) {
+          for (const p of Object.values(worldState.players)) {
+            if (!p.isAi && p.isSultanHassan) p.isSultanHassan = false;
+          }
+        }
+      } else if (!worldState.players[preset.id] && !humanHoldsMirqab) {
+        spawnSingleAiCityByPreset(preset, nextCfg.banditDifficulty);
+      }
+    }
+
+    if (
+      nextCfg.sultanHassanMode === 'ai_ruler' &&
+      prevCfg.sultanHassanMode !== 'ai_ruler' &&
+      !worldState.players['ai_sindhi_mirqab'] &&
+      nextCfg.enabledCities['ai_sindhi_mirqab'] !== false
+    ) {
+      for (const p of Object.values(worldState.players)) {
+        if (!p.isAi && p.isSultanHassan) p.isSultanHassan = false;
+      }
+      const mirqabPreset = AI_KINGDOM_PRESETS.find((p) => p.id === 'ai_sindhi_mirqab');
+      if (mirqabPreset) spawnSingleAiCityByPreset(mirqabPreset, nextCfg.banditDifficulty);
+    }
+
+    if (!nextCfg.banditsEnabled) {
+      clearAiPlayers(true);
+    } else {
+      const humans = Object.values(worldState.players).filter((p) => !p.isAi);
+      const anchorX = humans[0]?.camera.targetX ?? SPAWN_PLATEAUS[4].x;
+      const anchorZ = humans[0]?.camera.targetZ ?? SPAWN_PLATEAUS[4].z;
+      spawnBanditClans(nextCfg.banditDifficulty, nextCfg.banditCampCount, anchorX, anchorZ, true);
+    }
+    if (worldState.pveTheater) {
+      worldState.pveTheater.difficulty = nextCfg.banditDifficulty;
+      worldState.pveTheater.strongholdCount = nextCfg.banditsEnabled ? nextCfg.banditCampCount : 0;
+    }
+    structuresDirty = true;
+    broadcastWorldSnapshot('حدّث مدير العالم إعدادات القوى والمدن ونظام المواجهة');
   }
 
   app.get('/api/network-stats', (_req, res) => {
@@ -1802,60 +2184,73 @@ async function startServer() {
       const email = req.user?.email ?? '';
       const body = (req.body ?? {}) as Record<string, unknown>;
 
+      const livePlayer = Object.values(worldState.players).find(
+        (p) => !p.isAi && !p.isBandit && p.uid === uid
+      );
+
       const displayName =
         typeof body.displayName === 'string' && body.displayName.trim()
           ? body.displayName.trim().slice(0, 40)
-          : 'قائد الحصن';
+          : livePlayer?.name ?? 'قائد الحصن';
       const factionName =
         typeof body.factionName === 'string' && body.factionName.trim()
           ? body.factionName.trim().slice(0, 60)
-          : displayName;
+          : livePlayer?.factionName ?? displayName;
       const primaryColor =
         typeof body.primaryColor === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(body.primaryColor)
           ? body.primaryColor
-          : '#0d9488';
+          : livePlayer?.color ?? '#0d9488';
       const secondaryColor =
         typeof body.secondaryColor === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(body.secondaryColor)
           ? body.secondaryColor
-          : '#fbbf24';
-      const rawBanner = String(body.bannerPattern ?? 'crescent_star') as BannerPatternKind;
+          : livePlayer?.secondaryColor ?? '#fbbf24';
+      const rawBanner = String(
+        body.bannerPattern ?? livePlayer?.bannerPattern ?? 'crescent_star'
+      ) as BannerPatternKind;
       const bannerPattern: BannerPatternKind = BANNER_PATTERN_SPECS[rawBanner]
         ? rawBanner
         : 'crescent_star';
-      const culture: CultureKind = normalizeCultureKind(body.culture as string | undefined);
+      const culture: CultureKind = livePlayer
+        ? normalizeCultureKind(livePlayer.culture)
+        : normalizeCultureKind(body.culture as string | undefined);
 
-      const rawRes = (body.resources ?? {}) as Partial<PlayerResources>;
-      const resources: PlayerResources = {
-        wood: Math.max(0, Math.min(1000000, Math.round(Number(rawRes.wood ?? 750)))),
-        stone: Math.max(0, Math.min(1000000, Math.round(Number(rawRes.stone ?? 650)))),
-        gold: Math.max(0, Math.min(1000000, Math.round(Number(rawRes.gold ?? 500)))),
-        food: Math.max(0, Math.min(1000000, Math.round(Number(rawRes.food ?? 550)))),
-        cloth: Math.max(0, Math.min(1000000, Math.round(Number(rawRes.cloth ?? 380)))),
-        horses: Math.max(0, Math.min(1000000, Math.round(Number(rawRes.horses ?? 260)))),
-      };
+      let resources: PlayerResources;
+      let structures: BlockoutStructure[];
+      let units: BlockoutUnit[];
+      let camera: PlayerState['camera'];
 
-      const rawStructures = Array.isArray(body.structures)
-        ? (body.structures as BlockoutStructure[])
-        : [];
-      const structures: BlockoutStructure[] = rawStructures.slice(0, 400).filter(
-        (s) => s && typeof s.kind === 'string' && Boolean(STRUCTURE_SPECS[s.kind])
-      );
-
-      const rawUnits = Array.isArray(body.units) ? (body.units as BlockoutUnit[]) : [];
-      const units: BlockoutUnit[] = rawUnits.slice(0, 400).filter(
-        (u) => u && typeof u.kind === 'string' && Boolean(UNIT_SPECS[u.kind])
-      );
-
-      const rawCam = (body.camera ?? {}) as Partial<PlayerState['camera']>;
-      const camera: PlayerState['camera'] = {
-        targetX: Number(rawCam.targetX ?? 0),
-        targetZ: Number(rawCam.targetZ ?? 0),
-        zoom: Math.max(MIN_CAMERA_ZOOM, Math.min(MAX_CAMERA_ZOOM, Number(rawCam.zoom ?? 38))),
-        yaw: Number(rawCam.yaw ?? 0),
-        pitch: Number(rawCam.pitch ?? 58),
-        cursorX: Number(rawCam.cursorX ?? 0),
-        cursorZ: Number(rawCam.cursorZ ?? 0),
-      };
+      if (livePlayer) {
+        // Authoritative: never accept client-forged resources/units/structures
+        resources = { ...livePlayer.resources };
+        structures = Object.values(worldState.structures)
+          .filter((s) => s.ownerId === livePlayer.id)
+          .slice(0, 400);
+        units = Object.values(worldState.units)
+          .filter((u) => u.ownerId === livePlayer.id)
+          .slice(0, 400);
+        camera = { ...livePlayer.camera };
+      } else {
+        const existing = await loadKingdomByUid(uid, email);
+        resources = existing?.resources ?? {
+          wood: 750,
+          stone: 650,
+          gold: 500,
+          food: 550,
+          cloth: 380,
+          horses: 260,
+        };
+        structures = existing?.structures ?? [];
+        units = existing?.units ?? [];
+        camera = existing?.camera ?? {
+          targetX: SPAWN_PLATEAUS[4].x,
+          targetZ: SPAWN_PLATEAUS[4].z,
+          zoom: 38,
+          yaw: 0,
+          pitch: 58,
+          cursorX: SPAWN_PLATEAUS[4].x,
+          cursorZ: SPAWN_PLATEAUS[4].z,
+        };
+      }
 
       const saved = await saveKingdomByUid(uid, email, {
         displayName,
@@ -1877,6 +2272,173 @@ async function startServer() {
     }
   });
 
+  app.get('/api/admin/world', requireAdmin, (_req, res) => {
+    const structCountByOwner: Record<string, number> = {};
+    const keepCountByOwner: Record<string, number> = {};
+    for (const s of Object.values(worldState.structures)) {
+      structCountByOwner[s.ownerId] = (structCountByOwner[s.ownerId] ?? 0) + 1;
+      if (s.kind === 'keep' && s.hp > 0) {
+        keepCountByOwner[s.ownerId] = (keepCountByOwner[s.ownerId] ?? 0) + 1;
+      }
+    }
+    const unitCountByOwner: Record<string, number> = {};
+    for (const u of Object.values(worldState.units)) {
+      unitCountByOwner[u.ownerId] = (unitCountByOwner[u.ownerId] ?? 0) + 1;
+    }
+
+    const humanPlayers = Object.values(worldState.players)
+      .filter((p) => !p.isAi && !p.isBandit)
+      .map((p) => ({
+        id: p.id,
+        uid: p.uid ?? null,
+        name: p.name,
+        factionName: p.factionName,
+        isSultanHassan: Boolean(p.isSultanHassan),
+        isDefeated: Boolean(p.isDefeated),
+        connected: clientSockets.has(p.id),
+        keepsCount: keepCountByOwner[p.id] ?? 0,
+        structuresCount: structCountByOwner[p.id] ?? 0,
+        unitsCount: unitCountByOwner[p.id] ?? 0,
+      }));
+
+    const cfg = worldState.directorConfig ?? createDefaultDirectorConfig();
+    const cities = AI_KINGDOM_PRESETS.map((preset) => ({
+      id: preset.id,
+      nameAr: preset.cityNameAr,
+      factionKind: preset.aiFactionKind,
+      enabled: cfg.enabledCities[preset.id] !== false,
+      active: Boolean(worldState.players[preset.id]),
+      structuresCount: structCountByOwner[preset.id] ?? 0,
+      unitsCount: unitCountByOwner[preset.id] ?? 0,
+    }));
+
+    const activeBanditCamps = Object.values(worldState.players).filter(
+      (p) => p.isBandit && !p.isDefeated
+    ).length;
+
+    res.json({
+      directorConfig: cfg,
+      matchStatus: worldState.matchStatus ?? { status: 'active' },
+      humanPlayers,
+      cities,
+      activeBanditCamps,
+      tick: worldState.tick,
+    });
+  });
+
+  app.put('/api/admin/config', requireAdmin, (req, res) => {
+    const raw = (req.body ?? {}) as Partial<WorldDirectorConfig>;
+    const current = worldState.directorConfig ?? createDefaultDirectorConfig();
+    const pvpMode: PvpMode =
+      raw.pvpMode === 'free_for_all' || raw.pvpMode === 'coop' || raw.pvpMode === 'diplomacy'
+        ? raw.pvpMode
+        : current.pvpMode;
+    const sultanHassanMode: SultanHassanMode =
+      raw.sultanHassanMode === 'ai_ruler' ||
+      raw.sultanHassanMode === 'human_claimable' ||
+      raw.sultanHassanMode === 'disabled'
+        ? raw.sultanHassanMode
+        : current.sultanHassanMode;
+    const banditDifficulty: PveDifficulty =
+      raw.banditDifficulty === 'casual' ||
+      raw.banditDifficulty === 'balanced' ||
+      raw.banditDifficulty === 'aggressive'
+        ? raw.banditDifficulty
+        : current.banditDifficulty;
+    const enabledCities = { ...current.enabledCities };
+    if (raw.enabledCities && typeof raw.enabledCities === 'object') {
+      for (const preset of AI_KINGDOM_PRESETS) {
+        if (typeof raw.enabledCities[preset.id] === 'boolean') {
+          enabledCities[preset.id] = raw.enabledCities[preset.id];
+        }
+      }
+    }
+
+    const nextCfg: WorldDirectorConfig = {
+      pvpMode,
+      sultanHassanMode,
+      sultanHassanAssignedUid:
+        raw.sultanHassanAssignedUid !== undefined
+          ? typeof raw.sultanHassanAssignedUid === 'string' && raw.sultanHassanAssignedUid.trim()
+            ? raw.sultanHassanAssignedUid.trim()
+            : null
+          : current.sultanHassanAssignedUid,
+      enabledCities,
+      banditsEnabled:
+        typeof raw.banditsEnabled === 'boolean' ? raw.banditsEnabled : current.banditsEnabled,
+      banditDifficulty,
+      banditCampCount:
+        typeof raw.banditCampCount === 'number'
+          ? Math.max(1, Math.min(4, Math.round(raw.banditCampCount)))
+          : current.banditCampCount,
+      dominionVictoryTargetCities:
+        typeof raw.dominionVictoryTargetCities === 'number'
+          ? Math.max(2, Math.min(12, Math.round(raw.dominionVictoryTargetCities)))
+          : current.dominionVictoryTargetCities,
+    };
+
+    applyDirectorConfigLive(nextCfg);
+    res.json({ ok: true, directorConfig: worldState.directorConfig });
+  });
+
+  app.post('/api/admin/player-action', requireAdmin, (req, res) => {
+    const body = (req.body ?? {}) as { action?: string; targetPlayerId?: string };
+    const action = String(body.action || '');
+    const targetPid = String(body.targetPlayerId || '');
+
+    if (action === 'assign_sultan') {
+      const result = transferSultanHassanToHuman(targetPid);
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+      broadcastWorldSnapshot(result.message);
+      res.json(result);
+      return;
+    }
+
+    if (action === 'revoke_sultan') {
+      for (const p of Object.values(worldState.players)) {
+        if (!p.isAi && p.isSultanHassan) p.isSultanHassan = false;
+      }
+      if (worldState.directorConfig) {
+        worldState.directorConfig.sultanHassanAssignedUid = null;
+        if (worldState.directorConfig.sultanHassanMode !== 'disabled') {
+          worldState.directorConfig.sultanHassanMode = 'ai_ruler';
+        }
+        applyDirectorConfigLive(worldState.directorConfig);
+      }
+      res.json({ ok: true, message: 'تمت إعادة قيادة السلطان حسن إلى الذكاء الاصطناعي' });
+      return;
+    }
+
+    if (action === 'kick') {
+      const targetSocket = clientSockets.get(targetPid);
+      if (targetSocket) {
+        targetSocket.close(4003, 'Kicked by Admin');
+      }
+      delete worldState.players[targetPid];
+      for (const sid of Object.keys(worldState.structures)) {
+        if (worldState.structures[sid].ownerId === targetPid) delete worldState.structures[sid];
+      }
+      for (const uid of Object.keys(worldState.units)) {
+        if (worldState.units[uid].ownerId === targetPid) delete worldState.units[uid];
+      }
+      structuresDirty = true;
+      broadcastWorldSnapshot('تم إخراج أحد القادة من العالم بأمر المشرف');
+      res.json({ ok: true, message: 'تم طرد اللاعب وإزالة وحداته' });
+      return;
+    }
+
+    if (action === 'reset_world') {
+      performWorldReset();
+      res.json({ ok: true, message: 'تمت إعادة تهيئة العالم بالكامل' });
+      return;
+    }
+
+    res.status(400).json({ ok: false, error: 'Unknown admin action' });
+  });
+
   app.delete('/api/kingdom', requireAuth, async (req: AuthRequest, res) => {
     try {
       const uid = req.user?.uid;
@@ -1893,103 +2455,236 @@ async function startServer() {
     }
   });
 
-  wss.on('connection', (ws: WebSocket) => {
-    const humanPlayers = Object.values(worldState.players).filter((p) => !p.isAi);
-    const humanIndex = humanPlayers.length;
-    const preset = FACTION_PRESETS[humanIndex % FACTION_PRESETS.length];
-    // Human players start at Hisn al-Quful (SPAWN_PLATEAUS[4]) and nearby desert/river frontier cities so Sindhi State & Crusaders hold Mirqab & Jerusalem
-    const spawnCandidates = [
+  function performWorldReset() {
+    worldState.structures = {};
+    worldState.units = {};
+    combatEventsBuffer = [];
+    lastAlertTickByOwner.clear();
+    lastAiRaidTick.clear();
+    lastAiBuildTick.clear();
+    loadedSectors.clear();
+    worldState.resourceNodes = createInitialResourceNodes();
+    prewarmStrategicSectors();
+    worldState.climate = 'temperate_clear';
+    worldState.matchStatus = { status: 'active' };
+    worldState.diplomacy = {};
+
+    const humans = Object.values(worldState.players).filter((p) => !p.isAi);
+    let anchorX = SPAWN_PLATEAUS[4].x;
+    let anchorZ = SPAWN_PLATEAUS[4].z;
+    const humanSpawnSlots = [
       SPAWN_PLATEAUS[4],
       SPAWN_PLATEAUS[14],
       SPAWN_PLATEAUS[18],
       SPAWN_PLATEAUS[15],
       SPAWN_PLATEAUS[29],
       SPAWN_PLATEAUS[8],
-      ...SPAWN_PLATEAUS,
     ];
-    const occupiedCoords = Object.values(worldState.structures).filter((s) => s.kind === 'keep');
-    const spawnSlot =
-      humanIndex === 0
-        ? SPAWN_PLATEAUS[4]
-        : (spawnCandidates.find(
-            (cand) => !occupiedCoords.some((k) => Math.hypot(k.x - cand.x, k.z - cand.z) < 1200)
-          ) ?? SPAWN_PLATEAUS[4]);
-
-    const spawnBiome = getBiomeAt(spawnSlot.x, spawnSlot.z);
-    const spawnLocalClimate = getEffectiveClimateAt(
-      spawnSlot.x,
-      spawnSlot.z,
-      worldState.climate
-    );
-    const assignedCulture =
-      humanIndex === 0
-        ? preset.culture
-        : getRecommendedCultureForBiome(spawnBiome, spawnLocalClimate);
-    const playerId = `plr_${Math.random().toString(36).substring(2, 8)}`;
-
-    const newPlayer: PlayerState = {
-      id: playerId,
-      name: `قائد ${humanIndex + 1}`,
-      color: preset.color,
-      secondaryColor: preset.secondaryColor,
-      bannerPattern: preset.bannerPattern,
-      factionName:
-        humanIndex === 0
-          ? preset.factionName
-          : `${spawnSlot.continentNameAr}`,
-      culture: assignedCulture,
-      connectedAt: Date.now(),
-      pingMs: 12,
-      camera: {
-        targetX: spawnSlot.x,
-        targetZ: spawnSlot.z,
-        zoom: 38,
-        yaw: 0,
-        pitch: 58,
-        cursorX: spawnSlot.x,
-        cursorZ: spawnSlot.z,
-      },
-      resources: {
+    humans.forEach((p, idx) => {
+      const slot = humanSpawnSlots[idx % humanSpawnSlots.length];
+      if (idx === 0) {
+        anchorX = slot.x;
+        anchorZ = slot.z;
+      }
+      p.resources = {
         wood: 750,
         stone: 650,
         gold: 500,
         food: 550,
         cloth: 380,
         horses: 260,
-      },
-      packetsReceived: 0,
-      packetsSent: 1,
-      isAi: false,
-      isDefeated: false,
-      kills: 0,
-      losses: 0,
-      structuresRazed: 0,
-    };
+      };
+      p.trainingQueue = [];
+      p.isDefeated = false;
+      p.isSultanHassan = false;
+      p.kills = 0;
+      p.losses = 0;
+      p.structuresRazed = 0;
+      p.camera.targetX = slot.x;
+      p.camera.targetZ = slot.z;
+      spawnPlayerInitialBase(p, slot.x, slot.z, 'full_capital');
+    });
 
-    worldState.players[playerId] = newPlayer;
-    clientSockets.set(playerId, ws);
-
-    if (!Object.values(worldState.players).some((p) => p.isAi && !p.isBandit)) {
-      spawnOrganizedAiKingdoms(worldState.pveTheater?.difficulty ?? 'balanced');
+    const curDiff = worldState.directorConfig?.banditDifficulty ?? worldState.pveTheater?.difficulty ?? 'balanced';
+    const curStrongholds = worldState.directorConfig?.banditCampCount ?? worldState.pveTheater?.strongholdCount ?? 3;
+    clearAiPlayers(false);
+    spawnOrganizedAiKingdoms(curDiff);
+    if (worldState.directorConfig?.banditsEnabled !== false) {
+      spawnBanditClans(curDiff, curStrongholds, anchorX, anchorZ);
     }
-    if (!Object.values(worldState.players).some((p) => p.isBandit)) {
-      spawnBanditClans(
-        worldState.pveTheater?.difficulty ?? 'balanced',
-        worldState.pveTheater?.strongholdCount ?? 3,
-        spawnSlot.x,
-        spawnSlot.z
+    worldState.pveTheater = {
+      id: nextEntityId('theater'),
+      difficulty: curDiff,
+      strongholdCount: worldState.directorConfig?.banditsEnabled !== false ? curStrongholds : 0,
+      strongholdsCleared: 0,
+      startedAtMs: Date.now(),
+    };
+    structuresDirty = true;
+    resourcesDirty = true;
+
+    for (const [pid, client] of clientSockets.entries()) {
+      const slice = filterWorldSliceForPlayer(pid, true, true);
+      sendPacket(client, 'S2C_WORLD_SNAPSHOT', {
+        reason: 'تمت إعادة ضبط خريطة العالم وتضاريسها وبدء معركة جديدة',
+        world: {
+          ...worldState,
+          players: sanitizePlayersForRecipient(pid),
+          structures: slice.structures ?? {},
+          units: slice.units,
+          resourceNodes: slice.resourceNodes ?? {},
+          combatEvents: slice.combatEvents,
+        },
+      });
+    }
+  }
+
+  wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
+    const reqUrl = new URL(req.url || '/ws', 'http://localhost');
+    const requestedSessionToken = reqUrl.searchParams.get('sessionToken')?.trim() || '';
+    const adminKeyParam = reqUrl.searchParams.get('adminKey')?.trim() || '';
+    const adminTokenParam = reqUrl.searchParams.get('idToken')?.trim() || '';
+
+    let isAdminConn = false;
+    const expectedAdminSecret = process.env.ADMIN_SECRET?.trim();
+    if (expectedAdminSecret && adminKeyParam.length === expectedAdminSecret.length) {
+      isAdminConn = crypto.timingSafeEqual(
+        Buffer.from(adminKeyParam, 'utf8'),
+        Buffer.from(expectedAdminSecret, 'utf8')
       );
     }
+    if (!isAdminConn && adminTokenParam) {
+      const decoded = await verifyFirebaseBearer(`Bearer ${adminTokenParam}`);
+      const allowedAdminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+      if (decoded?.email && allowedAdminEmail && decoded.email.toLowerCase() === allowedAdminEmail) {
+        isAdminConn = true;
+      }
+    }
+    if (!isAdminConn && process.env.NODE_ENV !== 'production' && !expectedAdminSecret) {
+      const remoteAddr = req.socket?.remoteAddress || '';
+      if (remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') {
+        isAdminConn = true;
+      }
+    }
+    socketAdminMap.set(ws, isAdminConn);
 
-    ensureSectorsMaterialized(spawnSlot.x, spawnSlot.z, 1280);
-    spawnPlayerInitialBase(newPlayer, spawnSlot.x, spawnSlot.z, 'full_capital');
+    let playerId = '';
+    let sessionToken = '';
+    let newPlayer: PlayerState | undefined;
+    let preset = FACTION_PRESETS[0];
+
+    // Check reconnect within 90s grace period
+    const graceEntry = requestedSessionToken ? sessionGraceMap.get(requestedSessionToken) : undefined;
+    if (graceEntry && worldState.players[graceEntry.playerId]) {
+      clearTimeout(graceEntry.timer);
+      sessionGraceMap.delete(requestedSessionToken);
+      playerId = graceEntry.playerId;
+      sessionToken = requestedSessionToken;
+      newPlayer = worldState.players[playerId];
+      newPlayer.pingMs = 12;
+      clientSockets.set(playerId, ws);
+      socketTokenMap.set(ws, sessionToken);
+    } else {
+      const humanPlayers = Object.values(worldState.players).filter((p) => !p.isAi);
+      const humanIndex = humanPlayers.length;
+      preset = FACTION_PRESETS[humanIndex % FACTION_PRESETS.length];
+      const spawnCandidates = [
+        SPAWN_PLATEAUS[4],
+        SPAWN_PLATEAUS[14],
+        SPAWN_PLATEAUS[18],
+        SPAWN_PLATEAUS[15],
+        SPAWN_PLATEAUS[29],
+        SPAWN_PLATEAUS[8],
+        ...SPAWN_PLATEAUS,
+      ];
+      const occupiedCoords = Object.values(worldState.structures).filter((s) => s.kind === 'keep');
+      const spawnSlot =
+        humanIndex === 0
+          ? SPAWN_PLATEAUS[4]
+          : (spawnCandidates.find(
+              (cand) => !occupiedCoords.some((k) => Math.hypot(k.x - cand.x, k.z - cand.z) < 1200)
+            ) ?? SPAWN_PLATEAUS[4]);
+
+      const spawnBiome = getBiomeAt(spawnSlot.x, spawnSlot.z);
+      const spawnLocalClimate = getEffectiveClimateAt(
+        spawnSlot.x,
+        spawnSlot.z,
+        worldState.climate
+      );
+      const assignedCulture =
+        humanIndex === 0
+          ? preset.culture
+          : getRecommendedCultureForBiome(spawnBiome, spawnLocalClimate);
+      playerId = `plr_${crypto.randomBytes(4).toString('hex')}`;
+      sessionToken = crypto.randomBytes(18).toString('hex');
+
+      newPlayer = {
+        id: playerId,
+        name: `قائد ${humanIndex + 1}`,
+        color: preset.color,
+        secondaryColor: preset.secondaryColor,
+        bannerPattern: preset.bannerPattern,
+        factionName: humanIndex === 0 ? preset.factionName : `${spawnSlot.continentNameAr}`,
+        culture: assignedCulture,
+        trainingQueue: [],
+        connectedAt: Date.now(),
+        pingMs: 12,
+        camera: {
+          targetX: spawnSlot.x,
+          targetZ: spawnSlot.z,
+          zoom: 38,
+          yaw: 0,
+          pitch: 58,
+          cursorX: spawnSlot.x,
+          cursorZ: spawnSlot.z,
+        },
+        resources: {
+          wood: 750,
+          stone: 650,
+          gold: 500,
+          food: 550,
+          cloth: 380,
+          horses: 260,
+        },
+        packetsReceived: 0,
+        packetsSent: 1,
+        isAi: false,
+        isDefeated: false,
+        kills: 0,
+        losses: 0,
+        structuresRazed: 0,
+      };
+
+      worldState.players[playerId] = newPlayer;
+      clientSockets.set(playerId, ws);
+      socketTokenMap.set(ws, sessionToken);
+
+      if (!Object.values(worldState.players).some((p) => p.isAi && !p.isBandit)) {
+        spawnOrganizedAiKingdoms(worldState.directorConfig?.banditDifficulty ?? 'balanced');
+      }
+      if (
+        worldState.directorConfig?.banditsEnabled !== false &&
+        !Object.values(worldState.players).some((p) => p.isBandit)
+      ) {
+        spawnBanditClans(
+          worldState.directorConfig?.banditDifficulty ?? worldState.pveTheater?.difficulty ?? 'balanced',
+          worldState.directorConfig?.banditCampCount ?? worldState.pveTheater?.strongholdCount ?? 3,
+          spawnSlot.x,
+          spawnSlot.z
+        );
+      }
+
+      ensureSectorsMaterialized(spawnSlot.x, spawnSlot.z, 1280);
+      spawnPlayerInitialBase(newPlayer, spawnSlot.x, spawnSlot.z, 'full_capital');
+    }
 
     const welcomeSlice = filterWorldSliceForPlayer(playerId, true, true);
     sendPacket(ws, 'S2C_WELCOME', {
       playerId,
+      sessionToken,
       tickRateHz: TICK_RATE_HZ,
       world: {
         ...worldState,
+        players: sanitizePlayersForRecipient(playerId),
         structures: welcomeSlice.structures ?? {},
         units: welcomeSlice.units,
         resourceNodes: welcomeSlice.resourceNodes ?? {},
@@ -1999,8 +2694,26 @@ async function startServer() {
 
     broadcastWorldSnapshot(`انضم ${newPlayer.factionName} إلى الساحة`, playerId);
 
-    ws.on('message', (data: Buffer) => {
+    // Per-socket token-bucket rate limiter (45 msgs/sec burst)
+    let rlTokens = 45;
+    let rlLastRefill = Date.now();
+    let rlStrikes = 0;
+
+    ws.on('message', async (data: Buffer) => {
       try {
+        const nowMs = Date.now();
+        const elapsedSec = (nowMs - rlLastRefill) / 1000;
+        rlLastRefill = nowMs;
+        rlTokens = Math.min(45, rlTokens + elapsedSec * 45);
+        if (rlTokens < 1) {
+          rlStrikes += 1;
+          if (rlStrikes > 25) {
+            ws.close(1008, 'Rate limit exceeded');
+          }
+          return;
+        }
+        rlTokens -= 1;
+
         const packet = JSON.parse(data.toString()) as NetworkPacket<Record<string, unknown>>;
         const player = worldState.players[playerId];
         if (!player) return;
@@ -2150,8 +2863,10 @@ async function startServer() {
                     localClimate,
                     st.level
                   );
+                  const oldMax = Math.max(1, st.maxHp);
+                  const hpRatio = st.hp / oldMax;
                   st.maxHp = Math.round(spec.maxHp * lvlMult * envFit.maxHpMultiplier);
-                  st.hp = st.maxHp;
+                  st.hp = Math.max(1, Math.min(st.maxHp, Math.round(st.maxHp * hpRatio)));
                   adaptedCount += 1;
                 }
               }
@@ -2179,8 +2894,10 @@ async function startServer() {
                   getEffectiveClimateAt(st.x, st.z, worldState.climate),
                   st.level
                 );
+                const oldMax = Math.max(1, st.maxHp);
+                const hpRatio = st.hp / oldMax;
                 st.maxHp = Math.round(spec.maxHp * lvlMult * envFit.maxHpMultiplier);
-                st.hp = Math.min(st.maxHp, Math.max(st.hp, st.maxHp));
+                st.hp = Math.max(1, Math.min(st.maxHp, Math.round(st.maxHp * hpRatio)));
                 structuresDirty = true;
                 sendPacket(ws, 'S2C_PACKET_ACK', {
                   ackSeq: packet.seq,
@@ -2226,9 +2943,13 @@ async function startServer() {
             const kind = packet.payload?.kind as StructureKind;
             const rawCulture = packet.payload?.culture as CultureKind | undefined;
             const activeCulture: CultureKind = normalizeCultureKind(rawCulture ?? player.culture);
-            const x = quantize(Number(packet.payload?.x ?? 0));
-            const z = quantize(Number(packet.payload?.z ?? 0));
-            const rotationY = Number(packet.payload?.rotationY ?? 0);
+            const rawX = Number(packet.payload?.x);
+            const rawZ = Number(packet.payload?.z);
+            const rawRot = Number(packet.payload?.rotationY ?? 0);
+            if (!isFiniteNum(rawX) || !isFiniteNum(rawZ) || !isFiniteNum(rawRot)) return;
+            const x = clampCoord(rawX);
+            const z = clampCoord(rawZ);
+            const rotationY = rawRot;
 
             const spec = STRUCTURE_SPECS[kind];
             if (!spec) return;
@@ -2236,6 +2957,35 @@ async function startServer() {
             const playerStructures = Object.values(worldState.structures).filter(
               (s) => s.ownerId === player.id
             );
+
+            // Max 3 Keeps cap & 180m territory build range from nearest owned structure
+            if (kind === 'keep') {
+              const keepsOwned = playerStructures.filter((s) => s.kind === 'keep').length;
+              if (keepsOwned >= 3) {
+                sendPacket(ws, 'S2C_PACKET_ACK', {
+                  ackSeq: packet.seq,
+                  cmd: 'C2S_PLACE_STRUCTURE',
+                  ok: false,
+                  message: 'بلغت الحد الأقصى للقلاع الرئيسية (3 قلاع لكل مملكة)',
+                });
+                return;
+              }
+            }
+            if (playerStructures.length > 0 && !(kind === 'keep' && playerStructures.every((s) => s.kind !== 'keep'))) {
+              const nearestOwned = playerStructures.reduce(
+                (minD, s) => Math.min(minD, Math.hypot(s.x - x, s.z - z)),
+                Infinity
+              );
+              if (nearestOwned > 180) {
+                sendPacket(ws, 'S2C_PACKET_ACK', {
+                  ackSeq: packet.seq,
+                  cmd: 'C2S_PLACE_STRUCTURE',
+                  ok: false,
+                  message: 'خارج نطاق التوسع العمراني للمملكة (يجب البناء ضمن 180م من منشآتك)',
+                });
+                return;
+              }
+            }
             const urbanReport = evaluateKingdomUrbanization(
               playerStructures,
               normalizeCultureKind(player.culture),
@@ -2482,10 +3232,25 @@ async function startServer() {
               if (!spec) continue;
               if (urbanReport.tier < spec.requiredUrbanTier) continue;
 
-              const bx = quantize(Number(item.x ?? 0));
-              const bz = quantize(Number(item.z ?? 0));
-              const brot = Number(item.rotationY ?? 0);
+              const rawBx = Number(item.x);
+              const rawBz = Number(item.z);
+              const rawBrot = Number(item.rotationY ?? 0);
+              if (!isFiniteNum(rawBx) || !isFiniteNum(rawBz) || !isFiniteNum(rawBrot)) continue;
+              const bx = clampCoord(rawBx);
+              const bz = clampCoord(rawBz);
+              const brot = rawBrot;
               const activeCulture = normalizeCultureKind(item.culture ?? player.culture);
+
+              if (playerStructures.length > 0) {
+                const nearD = playerStructures.reduce(
+                  (m, s) => Math.min(m, Math.hypot(s.x - bx, s.z - bz)),
+                  Infinity
+                );
+                if (nearD > 180) {
+                  skippedCollision += 1;
+                  continue;
+                }
+              }
 
               const terrainCheck = isBuildableTerrain(bx, bz);
               if (!terrainCheck.ok) {
@@ -2713,6 +3478,8 @@ async function startServer() {
             }
 
             deductResources(player.resources, cost);
+            const oldMaxHp = Math.max(1, st.maxHp);
+            const hpRatio = st.hp / oldMaxHp;
             st.level = nextLevel as StructureLevel;
             const hpMultiplier = nextLevel === 2 ? 1.5 : 2.25;
             const stCulture = normalizeCultureKind(st.culture ?? player.culture);
@@ -2723,6 +3490,7 @@ async function startServer() {
               st.level
             );
             st.maxHp = Math.round(spec.maxHp * hpMultiplier * envFit.maxHpMultiplier);
+            st.hp = Math.max(1, Math.min(st.maxHp, Math.round(st.maxHp * hpRatio)));
             st.isConstructing = true;
             st.constructionProgress = 0;
             st.buildTimeSeconds = Math.max(9, Math.round((spec.buildTimeSeconds ?? 14) * 0.85));
@@ -2764,8 +3532,158 @@ async function startServer() {
             break;
           }
 
+          case 'C2S_DEMOLISH_STRUCTURE': {
+            const structureId = String(packet.payload?.structureId || '');
+            const st = worldState.structures[structureId];
+            if (!st || st.ownerId !== player.id) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_DEMOLISH_STRUCTURE',
+                ok: false,
+                message: 'لا يمكنك هدم هذا المبنى',
+              });
+              return;
+            }
+            if (st.kind === 'keep') {
+              const otherKeeps = Object.values(worldState.structures).filter(
+                (s) => s.ownerId === player.id && s.kind === 'keep' && s.id !== st.id && s.hp > 0
+              );
+              if (otherKeeps.length === 0) {
+                sendPacket(ws, 'S2C_PACKET_ACK', {
+                  ackSeq: packet.seq,
+                  cmd: 'C2S_DEMOLISH_STRUCTURE',
+                  ok: false,
+                  message: 'لا يمكن هدم القلعة الوحيدة للمملكة',
+                });
+                return;
+              }
+            }
+            const spec = STRUCTURE_SPECS[st.kind];
+            if (spec) {
+              player.resources.wood += Math.round((spec.cost.wood ?? 0) * 0.5);
+              player.resources.stone += Math.round((spec.cost.stone ?? 0) * 0.5);
+              player.resources.gold += Math.round((spec.cost.gold ?? 0) * 0.5);
+              player.resources.food += Math.round((spec.cost.food ?? 0) * 0.5);
+              player.resources.cloth += Math.round((spec.cost.cloth ?? 0) * 0.5);
+              player.resources.horses += Math.round((spec.cost.horses ?? 0) * 0.5);
+            }
+            delete worldState.structures[structureId];
+            for (const u of Object.values(worldState.units)) {
+              if (u.assignedStructureId === structureId) {
+                u.assignedStructureId = undefined;
+                if (u.state === 'building' || u.state === 'repairing') u.state = 'idle';
+              }
+            }
+            structuresDirty = true;
+            resourcesDirty = true;
+            sendPacket(ws, 'S2C_PACKET_ACK', {
+              ackSeq: packet.seq,
+              cmd: 'C2S_DEMOLISH_STRUCTURE',
+              ok: true,
+              message: `تم هدم ${spec?.labelAr ?? 'المبنى'} واسترداد 50% من موارده`,
+            });
+            break;
+          }
+
+          case 'C2S_CANCEL_TRAINING': {
+            const itemId = String(packet.payload?.itemId || '');
+            const queue = player.trainingQueue ?? [];
+            const idx = queue.findIndex((q) => q.id === itemId && q.ownerId === player.id);
+            if (idx === -1) return;
+            const [removed] = queue.splice(idx, 1);
+            player.trainingQueue = queue;
+            const uSpec = UNIT_SPECS[removed.unitKind];
+            if (uSpec) {
+              player.resources.wood += uSpec.cost.wood ?? 0;
+              player.resources.stone += uSpec.cost.stone ?? 0;
+              player.resources.gold += uSpec.cost.gold ?? 0;
+              player.resources.food += uSpec.cost.food ?? 0;
+              player.resources.cloth += uSpec.cost.cloth ?? 0;
+              player.resources.horses += uSpec.cost.horses ?? 0;
+            }
+            resourcesDirty = true;
+            sendPacket(ws, 'S2C_PACKET_ACK', {
+              ackSeq: packet.seq,
+              cmd: 'C2S_CANCEL_TRAINING',
+              ok: true,
+              message: `تم إلغاء تدريب ${uSpec?.shortAr ?? 'الوحدة'} واسترداد كامل التكلفة`,
+            });
+            break;
+          }
+
+          case 'C2S_DIPLOMACY_ACTION': {
+            const targetId = String(packet.payload?.targetId || '');
+            const action = String(packet.payload?.action || '');
+            const target = worldState.players[targetId];
+            if (!target || target.id === player.id || target.isBandit) return;
+            if (!worldState.diplomacy) worldState.diplomacy = {};
+            const key = diplomacyKey(player.id, targetId);
+            let nextRel: DiplomacyRelation = getDiplomacyRelation(player.id, targetId);
+            let msgAr = '';
+            if (action === 'declare_war') {
+              nextRel = 'war';
+              msgAr = `أعلن ${player.name} الحرب على ${target.name}!`;
+            } else if (action === 'propose_ally' || action === 'accept_ally') {
+              nextRel = 'ally';
+              msgAr = `أُبرم حلف وعهد قتال مشترك بين ${player.name} و${target.name}`;
+            } else if (action === 'break_ally' || action === 'set_neutral') {
+              nextRel = 'neutral';
+              msgAr = `عادت العلاقات بين ${player.name} و${target.name} إلى الهدنة الحيادية`;
+            } else {
+              return;
+            }
+            worldState.diplomacy[key] = nextRel;
+            broadcastWorldSnapshot(msgAr);
+            sendPacket(ws, 'S2C_PACKET_ACK', {
+              ackSeq: packet.seq,
+              cmd: 'C2S_DIPLOMACY_ACTION',
+              ok: true,
+              message: msgAr,
+            });
+            break;
+          }
+
+          case 'C2S_CLAIM_ROLE': {
+            const role = String(packet.payload?.role || '');
+            if (role !== 'sultan_hassan') return;
+            const cfg = worldState.directorConfig;
+            if (!cfg || cfg.sultanHassanMode !== 'human_claimable') {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_CLAIM_ROLE',
+                ok: false,
+                message: 'تولّي دور السلطان حسن غير متاح للاعبين حالياً (فعّله من لوحة الإدارة)',
+              });
+              return;
+            }
+            const alreadyTaken = Object.values(worldState.players).some(
+              (p) => !p.isAi && p.isSultanHassan && p.id !== player.id
+            );
+            if (alreadyTaken) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_CLAIM_ROLE',
+                ok: false,
+                message: 'تولّى لاعب آخر عرش السلطان حسن بالفعل',
+              });
+              return;
+            }
+            const transfer = transferSultanHassanToHuman(player.id);
+            if (transfer.ok) {
+              broadcastWorldSnapshot(transfer.message);
+            }
+            sendPacket(ws, 'S2C_PACKET_ACK', {
+              ackSeq: packet.seq,
+              cmd: 'C2S_CLAIM_ROLE',
+              ok: transfer.ok,
+              message: transfer.message,
+            });
+            break;
+          }
+
+          case 'C2S_QUEUE_UNIT':
           case 'C2S_SPAWN_UNIT': {
-            const kind = packet.payload?.kind as UnitKind;
+            const kind = (packet.payload?.unitKind ?? packet.payload?.kind) as UnitKind;
             const spec = UNIT_SPECS[kind];
             if (!spec) return;
 
@@ -2784,14 +3702,13 @@ async function startServer() {
               const reqSpec = URBANIZATION_TIERS[spec.requiredUrbanTier];
               sendPacket(ws, 'S2C_PACKET_ACK', {
                 ackSeq: packet.seq,
-                cmd: 'C2S_SPAWN_UNIT',
+                cmd: packet.type,
                 ok: false,
                 message: `يتطلب تجنيد ${spec.labelAr} بلوغ (${reqSpec.nameAr} — ${reqSpec.minScore} نقطة تحضر). ابنِ البيوت والمزارع لرفع مستوى التحضر!`,
               });
               return;
             }
 
-            // Compute housing population capacity & cavalry stable level via canonical shared helper
             const capacityReport = evaluateKingdomCapacity(
               playerStructures,
               normalizeCultureKind(player.culture),
@@ -2800,35 +3717,34 @@ async function startServer() {
               (sx, sz) => getEffectiveClimateAt(sx, sz, worldState.climate)
             );
             const maxPop = capacityReport.maxPopulation;
-
-            const currentUnitsCount = Object.values(worldState.units).filter(
+            const activeUnitsCount = Object.values(worldState.units).filter(
               (u) => u.ownerId === player.id
             ).length;
+            const queuedCount = (player.trainingQueue ?? []).length;
 
-            if (currentUnitsCount >= maxPop) {
+            if (queuedCount >= 10) {
               sendPacket(ws, 'S2C_PACKET_ACK', {
                 ackSeq: packet.seq,
-                cmd: 'C2S_SPAWN_UNIT',
+                cmd: packet.type,
                 ok: false,
-                message: `سعة المساكن والخيام والمرابط ممتلئة (${currentUnitsCount}/${maxPop}). ابنِ أو طوّر البيوت أو الخيام أو مربط الخيول لتجنيد المزيد!`,
+                message: 'طابور التدريب ممتلئ (الحد الأقصى 10 وحدات في الطابور)',
               });
               return;
             }
 
-            if (!canAfford(player.resources, spec.cost)) {
+            if (activeUnitsCount + queuedCount >= maxPop) {
               sendPacket(ws, 'S2C_PACKET_ACK', {
                 ackSeq: packet.seq,
-                cmd: 'C2S_SPAWN_UNIT',
+                cmd: packet.type,
                 ok: false,
-                message:
-                  'الموارد غير كافية لتدريب هذه الوحدة (تحقق من الغذاء والخشب والذهب والقماش والخيول المروضة)',
+                message: `سعة المساكن والخيام والمرابط ممتلئة (${activeUnitsCount + queuedCount}/${maxPop}). ابنِ أو طوّر البيوت أو الخيام أو المرابط أولاً!`,
               });
               return;
             }
 
             const requestedCampId =
-              typeof packet.payload?.structureId === 'string'
-                ? packet.payload.structureId
+              typeof (packet.payload?.campId ?? packet.payload?.structureId) === 'string'
+                ? String(packet.payload?.campId ?? packet.payload?.structureId)
                 : undefined;
             const requestedCamp = requestedCampId
               ? playerStructures.find(
@@ -2846,59 +3762,52 @@ async function startServer() {
                 : undefined) ||
               readyStructures.find((s) => s.kind === 'barracks') ||
               readyStructures.find((s) => s.kind === 'war_tent') ||
-              readyStructures.find((s) => s.kind === 'keep') ||
-              playerStructures.find((s) => s.kind === 'keep');
+              readyStructures.find((s) => s.kind === 'siege_workshop') ||
+              readyStructures.find((s) => s.kind === 'keep');
 
-            const baseX = spawnBase ? spawnBase.x : player.camera.targetX;
-            const baseZ = spawnBase ? spawnBase.z : player.camera.targetZ;
-            const angle = Math.random() * Math.PI * 2;
-            const dist = 4.6 + Math.random() * 2.2;
-            const ux = quantize(baseX + Math.cos(angle) * dist);
-            const uz = quantize(baseZ + Math.sin(angle) * dist);
+            if (!spawnBase) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: packet.type,
+                ok: false,
+                message: 'يجب امتلاك ثكنة أو معسكر أو قلعة مكتملة البناء لتدريب الوحدات',
+              });
+              return;
+            }
+
+            if (!canAfford(player.resources, spec.cost)) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: packet.type,
+                ok: false,
+                message:
+                  'الموارد غير كافية لتدريب هذه الوحدة (تحقق من الغذاء والخشب والذهب والقماش والخيول)',
+              });
+              return;
+            }
 
             deductResources(player.resources, spec.cost);
-            const unitId = nextEntityId('unt');
-            const effectiveUnitHp = Math.round(
-              spec.maxHp * urbanReport.unitHpMultiplier
-            );
-
-            // Cavalry units (knight, commander) gain +8% speed per Horse Stable level (up to +24%)
-            const highestStableLvl = capacityReport.highestStableLevel;
-            const cavalrySpeedMult =
-              kind === 'knight' || kind === 'commander'
-                ? 1 + highestStableLvl * 0.08
-                : 1.0;
-            const effectiveSpeed = quantize(spec.speed * cavalrySpeedMult);
-
-            worldState.units[unitId] = {
-              id: unitId,
-              ownerId: player.id,
-              ownerColor: player.color,
-              secondaryColor: player.secondaryColor ?? '#fbbf24',
-              bannerPattern: player.bannerPattern ?? 'crescent_star',
+            const durationReport = getUnitTrainingDurationSeconds(
               kind,
-              x: ux,
-              z: uz,
-              targetX: quantize(ux + Math.cos(angle) * 2.4),
-              targetZ: quantize(uz + Math.sin(angle) * 2.4),
-              rotationY: Math.round(angle * 100) / 100,
-              speed: effectiveSpeed,
-              state: 'moving',
-              activityAr: spawnBase
-                ? `تخرّج من ${STRUCTURE_SPECS[spawnBase.kind].labelAr.split(' (')[0]} (${spec.skills[0].nameAr})`
-                : `جاهز في الميدان (${spec.skills[0].nameAr})`,
-              hp: effectiveUnitHp,
-              maxHp: effectiveUnitHp,
+              spawnBase.kind,
+              spawnBase.level
+            );
+            const item: TrainingQueueItem = {
+              id: nextEntityId('trn'),
+              unitKind: kind,
+              campId: spawnBase.id,
+              durationSec: durationReport.seconds,
+              remainingSec: durationReport.seconds,
+              ownerId: player.id,
             };
+            if (!player.trainingQueue) player.trainingQueue = [];
+            player.trainingQueue.push(item);
 
-            const campNameAr = spawnBase
-              ? STRUCTURE_SPECS[spawnBase.kind].labelAr.split(' (')[0]
-              : 'معسكر التدريب';
             sendPacket(ws, 'S2C_PACKET_ACK', {
               ackSeq: packet.seq,
-              cmd: 'C2S_SPAWN_UNIT',
+              cmd: packet.type,
               ok: true,
-              message: `تم تدريب وتخريج ${spec.shortAr} من ${campNameAr} (صحة: ${effectiveUnitHp} · هجوم: ${spec.attack} · مهارة: ${spec.skills[0].nameAr})`,
+              message: `أُضيف ${spec.shortAr} إلى طابور التدريب (${durationReport.seconds}ث)`,
             });
             break;
           }
@@ -2907,8 +3816,11 @@ async function startServer() {
             const unitIds = Array.isArray(packet.payload?.unitIds)
               ? (packet.payload.unitIds as string[])
               : [];
-            const targetX = Number(packet.payload?.targetX ?? 0);
-            const targetZ = Number(packet.payload?.targetZ ?? 0);
+            const rawTx = Number(packet.payload?.targetX);
+            const rawTz = Number(packet.payload?.targetZ);
+            if (!isFiniteNum(rawTx) || !isFiniteNum(rawTz)) return;
+            const targetX = clampCoord(rawTx);
+            const targetZ = clampCoord(rawTz);
             const resourceId =
               typeof packet.payload?.resourceId === 'string'
                 ? packet.payload.resourceId
@@ -3188,6 +4100,15 @@ async function startServer() {
           }
 
           case 'C2S_SPAWN_PVE_FRONTS': {
+            if (!isSocketAdmin(ws)) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_SPAWN_PVE_FRONTS',
+                ok: false,
+                message: 'صلاحية المشرف مطلوبة لتغيير جبهات قطاع الطرق',
+              });
+              return;
+            }
             const rawDiff = packet.payload?.difficulty as PveDifficulty | undefined;
             const difficulty: PveDifficulty =
               rawDiff === 'casual' || rawDiff === 'balanced' || rawDiff === 'aggressive'
@@ -3501,6 +4422,15 @@ async function startServer() {
           }
 
           case 'C2S_SET_CLIMATE': {
+            if (!isSocketAdmin(ws)) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_SET_CLIMATE',
+                ok: false,
+                message: 'صلاحية المشرف مطلوبة لتغيير مناخ العالم',
+              });
+              return;
+            }
             const requestedClimate = packet.payload?.climate as ClimateKind | undefined;
             const toggleAuto = packet.payload?.autoCycleClimate;
 
@@ -3523,13 +4453,20 @@ async function startServer() {
           }
 
           case 'C2S_HYDRATE_FROM_CLOUD': {
-            const cloudResources = packet.payload?.resources as Partial<PlayerResources> | undefined;
-            const cloudStructures = Array.isArray(packet.payload?.structures)
-              ? (packet.payload.structures as BlockoutStructure[])
-              : [];
-            const cloudUnits = Array.isArray(packet.payload?.units)
-              ? (packet.payload.units as BlockoutUnit[])
-              : [];
+            const rawIdToken =
+              typeof packet.payload?.idToken === 'string' ? packet.payload.idToken.trim() : '';
+            let decoded: Awaited<ReturnType<typeof verifyFirebaseBearer>> = null;
+            if (rawIdToken) {
+              try {
+                decoded = await verifyFirebaseBearer(`Bearer ${rawIdToken}`);
+              } catch {
+                decoded = null;
+              }
+            }
+            if (decoded && decoded.email_verified !== true) {
+              decoded = null;
+            }
+
             const displayName =
               typeof packet.payload?.displayName === 'string'
                 ? packet.payload.displayName.trim().slice(0, 40)
@@ -3553,32 +4490,51 @@ async function startServer() {
               rawBanner && BANNER_PATTERN_SPECS[rawBanner] ? rawBanner : undefined;
             const rawCulture = packet.payload?.culture as string | undefined;
             const culture = rawCulture ? normalizeCultureKind(rawCulture) : undefined;
-            const cloudCamera = packet.payload?.camera as Partial<PlayerState['camera']> | undefined;
 
-            if (displayName) {
-              player.name = displayName;
-            }
-            if (factionName) {
-              player.factionName = factionName;
-            } else if (displayName) {
-              player.factionName = displayName;
-            }
+            if (displayName) player.name = displayName;
+            if (factionName) player.factionName = factionName;
+            else if (displayName) player.factionName = displayName;
             if (primaryColor) player.color = primaryColor;
             if (secondaryColor) player.secondaryColor = secondaryColor;
             if (bannerPattern) player.bannerPattern = bannerPattern;
             if (culture) player.culture = culture;
 
+            // Only load authoritative resources/structures/units from Cloud SQL after verifying Firebase UID
+            if (!decoded) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_HYDRATE_FROM_CLOUD',
+                ok: false,
+                message: 'تم تحديث الهوية الشكلية فقط — يلزم توثيق حساب Firebase لاستعادة الحفظ السحابي',
+              });
+              break;
+            }
+
+            player.uid = decoded.uid;
+            const dbKingdom = await loadKingdomByUid(decoded.uid, decoded.email ?? '');
+            if (!dbKingdom) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_HYDRATE_FROM_CLOUD',
+                ok: true,
+                message: `تم ربط الحساب السحابي لقائد ${player.name}`,
+              });
+              break;
+            }
+
+            const cloudResources = dbKingdom.resources;
+            const cloudStructures = (dbKingdom.structures ?? []).slice(0, 300);
+            const cloudUnits = (dbKingdom.units ?? []).slice(0, 300);
+            const cloudCamera = dbKingdom.camera;
+
             if (cloudResources) {
               player.resources = {
-                wood: Math.max(0, Number(cloudResources.wood ?? player.resources.wood)),
-                stone: Math.max(0, Number(cloudResources.stone ?? player.resources.stone)),
-                gold: Math.max(0, Number(cloudResources.gold ?? player.resources.gold)),
-                food: Math.max(0, Number(cloudResources.food ?? player.resources.food)),
-                cloth: Math.max(0, Number(cloudResources.cloth ?? player.resources.cloth ?? 380)),
-                horses: Math.max(
-                  0,
-                  Number(cloudResources.horses ?? player.resources.horses ?? 260)
-                ),
+                wood: Math.max(0, Math.min(250_000, Number(cloudResources.wood ?? player.resources.wood))),
+                stone: Math.max(0, Math.min(250_000, Number(cloudResources.stone ?? player.resources.stone))),
+                gold: Math.max(0, Math.min(250_000, Number(cloudResources.gold ?? player.resources.gold))),
+                food: Math.max(0, Math.min(250_000, Number(cloudResources.food ?? player.resources.food))),
+                cloth: Math.max(0, Math.min(250_000, Number(cloudResources.cloth ?? player.resources.cloth ?? 380))),
+                horses: Math.max(0, Math.min(250_000, Number(cloudResources.horses ?? player.resources.horses ?? 260))),
               };
             }
 
@@ -3604,13 +4560,16 @@ async function startServer() {
                 player.camera.targetZ = homeZ;
               } else if (
                 cloudCamera &&
-                typeof cloudCamera.targetX === 'number' &&
-                typeof cloudCamera.targetZ === 'number'
+                isFiniteNum(cloudCamera.targetX) &&
+                isFiniteNum(cloudCamera.targetZ)
               ) {
-                player.camera.targetX = cloudCamera.targetX;
-                player.camera.targetZ = cloudCamera.targetZ;
-                if (typeof cloudCamera.zoom === 'number') {
-                  player.camera.zoom = cloudCamera.zoom;
+                player.camera.targetX = clampCoord(cloudCamera.targetX);
+                player.camera.targetZ = clampCoord(cloudCamera.targetZ);
+                if (isFiniteNum(cloudCamera.zoom)) {
+                  player.camera.zoom = Math.max(
+                    MIN_CAMERA_ZOOM,
+                    Math.min(MAX_CAMERA_ZOOM, cloudCamera.zoom)
+                  );
                 }
               }
             }
@@ -3626,10 +4585,13 @@ async function startServer() {
               cloudStructures.forEach((cs) => {
                 const spec = STRUCTURE_SPECS[cs.kind];
                 if (!spec) return;
-                const sid = cs.id || nextEntityId('str');
+                const sid = nextEntityId('str');
                 const validCulture: CultureKind = normalizeCultureKind(
                   (cs.culture as string | undefined) ?? player.culture
                 );
+                const lvl = (cs.level === 2 || cs.level === 3 ? cs.level : 1) as StructureLevel;
+                const maxHp = Math.max(100, Math.min(spec.maxHp * 3.5, Number(cs.maxHp ?? spec.maxHp)));
+                const hp = Math.max(1, Math.min(maxHp, Number(cs.hp ?? maxHp)));
                 worldState.structures[sid] = {
                   id: sid,
                   ownerId: playerId,
@@ -3638,72 +4600,22 @@ async function startServer() {
                   bannerPattern: player.bannerPattern ?? 'crescent_star',
                   kind: cs.kind,
                   culture: validCulture,
-                  level: (cs.level === 2 || cs.level === 3 ? cs.level : 1) as StructureLevel,
-                  x: quantize(Number(cs.x ?? 0) + shiftX),
-                  z: quantize(Number(cs.z ?? 0) + shiftZ),
-                  rotationY: Number(cs.rotationY ?? 0),
-                  hp: Number(cs.hp ?? spec.maxHp),
-                  maxHp: Number(cs.maxHp ?? spec.maxHp),
+                  level: lvl,
+                  x: clampCoord(Number(cs.x ?? 0) + shiftX),
+                  z: clampCoord(Number(cs.z ?? 0) + shiftZ),
+                  rotationY: isFiniteNum(cs.rotationY) ? cs.rotationY : 0,
+                  hp,
+                  maxHp,
                   createdAtTick: worldState.tick,
                   isConstructing: Boolean(cs.isConstructing),
                   constructionProgress:
                     typeof cs.constructionProgress === 'number'
-                      ? cs.constructionProgress
+                      ? Math.max(0, Math.min(100, cs.constructionProgress))
                       : undefined,
                   buildTimeSeconds:
                     typeof cs.buildTimeSeconds === 'number' ? cs.buildTimeSeconds : undefined,
                 };
               });
-
-              // Ensure older cloud saves that predated Houses/Markets/Temples get the new cultural buildings
-              const myHydrated = Object.values(worldState.structures).filter(
-                (s) => s.ownerId === playerId
-              );
-              const hasHouse = myHydrated.some((s) => s.kind === 'house');
-              if (!hasHouse) {
-                const keepSt = myHydrated.find((s) => s.kind === 'keep') ?? myHydrated[0];
-                const bx = keepSt ? keepSt.x : preset.spawnX;
-                const bz = keepSt ? keepSt.z : preset.spawnZ;
-                const dirX = bx < 0 ? 1 : -1;
-                const dirZ = bz < 0 ? 1 : -1;
-                const cKind: CultureKind = normalizeCultureKind(player.culture);
-                const extraBuildings: Array<{
-                  kind: StructureKind;
-                  level: StructureLevel;
-                  dx: number;
-                  dz: number;
-                  rot: number;
-                }> = [
-                  { kind: 'house', level: 1, dx: -dirX * 6, dz: -2, rot: 0 },
-                  { kind: 'house', level: 2, dx: -dirX * 6, dz: 4, rot: Math.PI / 2 },
-                  { kind: 'house', level: 3, dx: -dirX * 11, dz: 1, rot: 0 },
-                  { kind: 'market', level: 2, dx: 0, dz: -dirZ * 8, rot: 0 },
-                  { kind: 'temple', level: 2, dx: -dirX * 8, dz: -dirZ * 8, rot: 0 },
-                ];
-                extraBuildings.forEach((eb) => {
-                  const id = nextEntityId('str');
-                  const spec = STRUCTURE_SPECS[eb.kind];
-                  const hpMult = eb.level === 2 ? 1.5 : eb.level === 3 ? 2.25 : 1;
-                  const maxHp = Math.round(spec.maxHp * hpMult);
-                  worldState.structures[id] = {
-                    id,
-                    ownerId: playerId,
-                    ownerColor: player.color,
-                    secondaryColor: player.secondaryColor ?? '#fbbf24',
-                    bannerPattern: player.bannerPattern ?? 'crescent_star',
-                    kind: eb.kind,
-                    culture: cKind,
-                    level: eb.level,
-                    x: bx + eb.dx,
-                    z: bz + eb.dz,
-                    rotationY: eb.rot,
-                    hp: maxHp,
-                    maxHp,
-                    createdAtTick: worldState.tick,
-                  };
-                });
-              }
-
               structuresDirty = true;
             }
 
@@ -3713,45 +4625,16 @@ async function startServer() {
                   delete worldState.units[uid];
                 }
               }
-              const nowMs = Date.now();
               cloudUnits.forEach((cu) => {
                 const spec = UNIT_SPECS[cu.kind];
                 if (!spec) return;
-                const uid = cu.id || nextEntityId('unt');
-                let ux = quantize(Number(cu.x ?? 0) + shiftX);
-                let uz = quantize(Number(cu.z ?? 0) + shiftZ);
-                let tx = quantize(Number(cu.targetX ?? cu.x ?? 0) + shiftX);
-                let tz = quantize(Number(cu.targetZ ?? cu.z ?? 0) + shiftZ);
-                let unitWaypoints: MarchWaypoint[] | undefined = Array.isArray(cu.waypoints)
-                  ? cu.waypoints.map((wp) => ({
-                      x: quantize(Number(wp.x ?? 0) + shiftX),
-                      z: quantize(Number(wp.z ?? 0) + shiftZ),
-                    }))
-                  : undefined;
-                let unitState: BlockoutUnit['state'] =
-                  cu.state === 'moving' ||
-                  cu.state === 'gathering' ||
-                  cu.state === 'building'
-                    ? cu.state
-                    : 'idle';
-                let etaMs = typeof cu.etaServerMs === 'number' ? cu.etaServerMs : undefined;
-                let marchLabel = cu.marchOrderLabelAr;
-
-                // Analytical offline march catch-up if player returns while army was marching!
-                if (unitWaypoints && unitWaypoints.length > 0 && etaMs && cu.departedAtMs) {
-                  if (nowMs >= etaMs) {
-                    const lastWp = unitWaypoints[unitWaypoints.length - 1];
-                    ux = lastWp.x;
-                    uz = lastWp.z;
-                    tx = lastWp.x;
-                    tz = lastWp.z;
-                    unitWaypoints = undefined;
-                    etaMs = undefined;
-                    marchLabel = undefined;
-                    unitState = 'idle';
-                  }
-                }
-
+                const uid = nextEntityId('unt');
+                const ux = clampCoord(Number(cu.x ?? 0) + shiftX);
+                const uz = clampCoord(Number(cu.z ?? 0) + shiftZ);
+                const tx = clampCoord(Number(cu.targetX ?? cu.x ?? 0) + shiftX);
+                const tz = clampCoord(Number(cu.targetZ ?? cu.z ?? 0) + shiftZ);
+                const maxHp = Math.max(50, Math.min(spec.maxHp * 2.5, Number(cu.maxHp ?? spec.maxHp)));
+                const hp = Math.max(1, Math.min(maxHp, Number(cu.hp ?? maxHp)));
                 worldState.units[uid] = {
                   id: uid,
                   ownerId: playerId,
@@ -3763,16 +4646,11 @@ async function startServer() {
                   z: uz,
                   targetX: tx,
                   targetZ: tz,
-                  rotationY: Number(cu.rotationY ?? 0),
-                  speed: Number(cu.speed ?? spec.speed),
-                  state: unitState,
-                  waypoints: unitWaypoints,
-                  departedAtMs: cu.departedAtMs,
-                  totalDistanceM: cu.totalDistanceM,
-                  etaServerMs: etaMs,
-                  marchOrderLabelAr: marchLabel,
-                  hp: Number(cu.hp ?? spec.maxHp),
-                  maxHp: Number(cu.maxHp ?? spec.maxHp),
+                  rotationY: isFiniteNum(cu.rotationY) ? cu.rotationY : 0,
+                  speed: spec.speed,
+                  state: 'idle',
+                  hp,
+                  maxHp,
                 };
               });
             }
@@ -3782,6 +4660,7 @@ async function startServer() {
               reason: `تمت مزامنة قاعدة وجيوش ${player.factionName} من الحفظ السحابي`,
               world: {
                 ...worldState,
+                players: sanitizePlayersForRecipient(playerId),
                 structures: hydratedSlice.structures ?? {},
                 units: hydratedSlice.units,
                 resourceNodes: hydratedSlice.resourceNodes ?? {},
@@ -3791,81 +4670,16 @@ async function startServer() {
           }
 
           case 'C2S_RESET_WORLD': {
-            worldState.structures = {};
-            worldState.units = {};
-            combatEventsBuffer = [];
-            lastAlertTickByOwner.clear();
-            lastAiRaidTick.clear();
-            lastAiBuildTick.clear();
-            loadedSectors.clear();
-            worldState.resourceNodes = createInitialResourceNodes();
-            prewarmStrategicSectors();
-            worldState.climate = 'temperate_clear';
-
-            const humans = Object.values(worldState.players).filter((p) => !p.isAi);
-            let anchorX = SPAWN_PLATEAUS[4].x;
-            let anchorZ = SPAWN_PLATEAUS[4].z;
-
-            const humanSpawnSlots = [
-              SPAWN_PLATEAUS[4],
-              SPAWN_PLATEAUS[14],
-              SPAWN_PLATEAUS[18],
-              SPAWN_PLATEAUS[15],
-              SPAWN_PLATEAUS[29],
-              SPAWN_PLATEAUS[8],
-            ];
-            humans.forEach((p, idx) => {
-              const slot = humanSpawnSlots[idx % humanSpawnSlots.length];
-              if (idx === 0) {
-                anchorX = slot.x;
-                anchorZ = slot.z;
-              }
-              p.resources = {
-                wood: 750,
-                stone: 650,
-                gold: 500,
-                food: 550,
-                cloth: 380,
-                horses: 260,
-              };
-              p.isDefeated = false;
-              p.kills = 0;
-              p.losses = 0;
-              p.structuresRazed = 0;
-              p.camera.targetX = slot.x;
-              p.camera.targetZ = slot.z;
-              spawnPlayerInitialBase(p, slot.x, slot.z, 'full_capital');
-            });
-
-            const curDiff = worldState.pveTheater?.difficulty ?? 'balanced';
-            const curStrongholds = worldState.pveTheater?.strongholdCount ?? 3;
-            clearAiPlayers(false);
-            spawnOrganizedAiKingdoms(curDiff);
-            spawnBanditClans(curDiff, curStrongholds, anchorX, anchorZ);
-            worldState.pveTheater = {
-              id: nextEntityId('theater'),
-              difficulty: curDiff,
-              strongholdCount: curStrongholds,
-              strongholdsCleared: 0,
-              startedAtMs: Date.now(),
-            };
-
-            structuresDirty = true;
-            resourcesDirty = true;
-
-            for (const [pid, client] of clientSockets.entries()) {
-              const slice = filterWorldSliceForPlayer(pid, true, true);
-              sendPacket(client, 'S2C_WORLD_SNAPSHOT', {
-                reason: 'تمت إعادة ضبط خريطة العالم وتضاريسها وبدء معركة جديدة',
-                world: {
-                  ...worldState,
-                  structures: slice.structures ?? {},
-                  units: slice.units,
-                  resourceNodes: slice.resourceNodes ?? {},
-                  combatEvents: slice.combatEvents,
-                },
+            if (!isSocketAdmin(ws)) {
+              sendPacket(ws, 'S2C_PACKET_ACK', {
+                ackSeq: packet.seq,
+                cmd: 'C2S_RESET_WORLD',
+                ok: false,
+                message: 'صلاحية المشرف مطلوبة لإعادة ضبط العالم',
               });
+              return;
             }
+            performWorldReset();
             break;
           }
         }
@@ -3875,20 +4689,30 @@ async function startServer() {
     });
 
     ws.on('close', () => {
-      clientSockets.delete(playerId);
-      delete worldState.players[playerId];
-      for (const sid of Object.keys(worldState.structures)) {
-        if (worldState.structures[sid].ownerId === playerId) {
-          delete worldState.structures[sid];
-        }
+      if (clientSockets.get(playerId) === ws) {
+        clientSockets.delete(playerId);
       }
-      for (const uid of Object.keys(worldState.units)) {
-        if (worldState.units[uid].ownerId === playerId) {
-          delete worldState.units[uid];
-        }
+      const token = socketTokenMap.get(ws) || sessionToken;
+      if (token && worldState.players[playerId]) {
+        const timer = setTimeout(() => {
+          sessionGraceMap.delete(token);
+          if (clientSockets.has(playerId)) return;
+          delete worldState.players[playerId];
+          for (const sid of Object.keys(worldState.structures)) {
+            if (worldState.structures[sid].ownerId === playerId) {
+              delete worldState.structures[sid];
+            }
+          }
+          for (const uid of Object.keys(worldState.units)) {
+            if (worldState.units[uid].ownerId === playerId) {
+              delete worldState.units[uid];
+            }
+          }
+          structuresDirty = true;
+          broadcastWorldSnapshot(`غادر القائد (${playerId}) الجلسة بعد انتهاء مهلة العودة`);
+        }, 90_000);
+        sessionGraceMap.set(token, { playerId, uid: worldState.players[playerId]?.uid, timer });
       }
-      structuresDirty = true;
-      broadcastWorldSnapshot(`غادر القائد (${playerId}) الجلسة`);
     });
   });
 
@@ -3911,7 +4735,131 @@ async function startServer() {
       combatEventsBuffer = combatEventsBuffer.filter((ev) => worldState.tick - ev.tick <= 16);
     }
 
-    for (const unit of Object.values(worldState.units)) {
+    // Build 40m spatial hash grid for units to eliminate O(N*M) nested scans
+    const SPATIAL_CELL_M = 40;
+    const unitGrid = new Map<string, BlockoutUnit[]>();
+    const allUnitsList = Object.values(worldState.units);
+    for (let ui = 0; ui < allUnitsList.length; ui++) {
+      const u = allUnitsList[ui];
+      if (u.hp <= 0) continue;
+      const gx = Math.floor(u.x / SPATIAL_CELL_M);
+      const gz = Math.floor(u.z / SPATIAL_CELL_M);
+      const gKey = `${gx}_${gz}`;
+      let cell = unitGrid.get(gKey);
+      if (!cell) {
+        cell = [];
+        unitGrid.set(gKey, cell);
+      }
+      cell.push(u);
+    }
+
+    const queryNearbyUnits = (x: number, z: number, radius: number, out: BlockoutUnit[]) => {
+      out.length = 0;
+      const rCells = Math.ceil(radius / SPATIAL_CELL_M);
+      const cgx = Math.floor(x / SPATIAL_CELL_M);
+      const cgz = Math.floor(z / SPATIAL_CELL_M);
+      for (let dz = -rCells; dz <= rCells; dz++) {
+        for (let dx = -rCells; dx <= rCells; dx++) {
+          const cell = unitGrid.get(`${cgx + dx}_${cgz + dz}`);
+          if (cell) {
+            for (let i = 0; i < cell.length; i++) out.push(cell[i]);
+          }
+        }
+      }
+    };
+
+    const scratchNearUnits: BlockoutUnit[] = [];
+
+    // Advance Server-Authoritative Unit Training Queues
+    for (const plr of Object.values(worldState.players)) {
+      if (plr.isAi || plr.isBandit || !plr.trainingQueue || plr.trainingQueue.length === 0) {
+        continue;
+      }
+      const head = plr.trainingQueue[0];
+      head.remainingSec = Math.max(0, Math.round((head.remainingSec - dt) * 100) / 100);
+      if (head.remainingSec <= 0) {
+        plr.trainingQueue.shift();
+        const uSpec = UNIT_SPECS[head.unitKind];
+        const camp =
+          worldState.structures[head.campId] ??
+          Object.values(worldState.structures).find(
+            (s) => s.ownerId === plr.id && s.kind === 'keep'
+          );
+        const plrStructs = Object.values(worldState.structures).filter((s) => s.ownerId === plr.id);
+        const capReport = evaluateKingdomCapacity(
+          plrStructs,
+          normalizeCultureKind(plr.culture),
+          worldState.climate,
+          getBiomeAt,
+          (sx, sz) => getEffectiveClimateAt(sx, sz, worldState.climate)
+        );
+        const urbanRep = evaluateKingdomUrbanization(
+          plrStructs,
+          normalizeCultureKind(plr.culture),
+          worldState.climate,
+          getBiomeAt,
+          (sx, sz) => getEffectiveClimateAt(sx, sz, worldState.climate)
+        );
+        if (uSpec && camp) {
+          const angle = Math.random() * Math.PI * 2;
+          const dist = 4.6 + Math.random() * 2.2;
+          const ux = clampCoord(camp.x + Math.cos(angle) * dist);
+          const uz = clampCoord(camp.z + Math.sin(angle) * dist);
+          const cavMult =
+            head.unitKind === 'knight' || head.unitKind === 'commander'
+              ? 1 + capReport.highestStableLevel * 0.08
+              : 1.0;
+          const hp = Math.round(uSpec.maxHp * urbanRep.unitHpMultiplier);
+          const uid = nextEntityId('unt');
+          worldState.units[uid] = {
+            id: uid,
+            ownerId: plr.id,
+            ownerColor: plr.color,
+            secondaryColor: plr.secondaryColor ?? '#fbbf24',
+            bannerPattern: plr.bannerPattern ?? 'crescent_star',
+            kind: head.unitKind,
+            x: ux,
+            z: uz,
+            targetX: clampCoord(ux + Math.cos(angle) * 2.4),
+            targetZ: clampCoord(uz + Math.sin(angle) * 2.4),
+            rotationY: Math.round(angle * 100) / 100,
+            speed: quantize(uSpec.speed * cavMult),
+            state: 'moving',
+            activityAr: `تخرّج من ${STRUCTURE_SPECS[camp.kind].labelAr.split(' (')[0]} (${uSpec.skills[0].nameAr})`,
+            hp,
+            maxHp: hp,
+          };
+          const sock = clientSockets.get(plr.id);
+          if (sock) {
+            sendPacket(sock, 'S2C_PACKET_ACK', {
+              ackSeq: 0,
+              cmd: 'C2S_QUEUE_UNIT',
+              ok: true,
+              message: `اكتمل تدريب ${uSpec.shortAr} والتحق بجيشك`,
+            });
+          }
+        }
+      }
+    }
+
+    for (const unit of allUnitsList) {
+      // Tick Archer Fire-Arrow DoT
+      if ((unit.burnUntilTick ?? 0) >= worldState.tick && worldState.tick % 20 === 0 && unit.hp > 0) {
+        unit.hp = Math.max(0, unit.hp - 4);
+        if (unit.hp <= 0) {
+          delete worldState.units[unit.id];
+          pushCombatEvent({
+            kind: 'destruction',
+            fromX: unit.x,
+            fromZ: unit.z,
+            toX: unit.x,
+            toZ: unit.z,
+            targetOwnerId: unit.ownerId,
+          });
+          continue;
+        }
+      }
+
       const dx = unit.targetX - unit.x;
       const dz = unit.targetZ - unit.z;
       const dist = Math.hypot(dx, dz);
@@ -3923,6 +4871,18 @@ async function startServer() {
           unit.kind,
           worldState.climate
         );
+        if ((unit.slowUntilTick ?? 0) >= worldState.tick) {
+          speedMult *= 0.55;
+        }
+        // Commander aura (+15% march speed to nearby allies)
+        queryNearbyUnits(unit.x, unit.z, 24, scratchNearUnits);
+        for (let ai = 0; ai < scratchNearUnits.length; ai++) {
+          const au = scratchNearUnits[ai];
+          if (au.ownerId === unit.ownerId && au.kind === 'commander' && Math.hypot(au.x - unit.x, au.z - unit.z) <= 24) {
+            speedMult *= 1.15;
+            break;
+          }
+        }
         // Bandits move unimpeded in dense forests and gain burst speed during ambushes & retreats!
         if (unit.isBanditUnit) {
           if (getBiomeAt(unit.x, unit.z) === 'western_forest') {
@@ -3956,7 +4916,7 @@ async function startServer() {
             moatSlowMult = Math.min(moatSlowMult, waterFactor);
             if (worldState.tick % 20 === 0) {
               const spikeDmg = 5 + st.level * 3;
-              unit.hp = Math.max(1, unit.hp - spikeDmg);
+              unit.hp = Math.max(0, unit.hp - spikeDmg);
               pushCombatEvent({
                 kind: 'melee',
                 fromX: st.x,
@@ -3968,6 +4928,22 @@ async function startServer() {
                 damage: spikeDmg,
                 color: '#60a5fa',
               });
+              if (unit.hp <= 0) {
+                delete worldState.units[unit.id];
+                const defP = worldState.players[unit.ownerId];
+                const moatP = worldState.players[st.ownerId];
+                if (moatP) moatP.kills = (moatP.kills ?? 0) + 1;
+                if (defP) defP.losses = (defP.losses ?? 0) + 1;
+                pushCombatEvent({
+                  kind: 'destruction',
+                  fromX: unit.x,
+                  fromZ: unit.z,
+                  toX: unit.x,
+                  toZ: unit.z,
+                  targetOwnerId: unit.ownerId,
+                });
+                break;
+              }
             }
           } else if (st.kind === 'stone_wall' || st.kind === 'gatehouse') {
             const shouldBlock =
@@ -3986,25 +4962,44 @@ async function startServer() {
             }
           }
         }
+        if (unit.hp <= 0) continue;
 
         if (blockingFort) {
-          // Blocked by enemy wall/gate (or locked gate): hostile units automatically engage to breach it!
+          // Friendly units locked out of a closed gatehouse or non-combat units slide tangentially
           if (isHostileOwners(unit.ownerId, blockingFort.ownerId) && unit.kind !== 'worker') {
             unit.targetStructureId = blockingFort.id;
             unit.state = 'attacking';
             unit.activityAr = `يحاول اختراق ${STRUCTURE_SPECS[blockingFort.kind].labelAr.split(' (')[0]}`;
+            unit.targetX = unit.x;
+            unit.targetZ = unit.z;
+          } else {
+            const nx = unit.x - blockingFort.x;
+            const nz = unit.z - blockingFort.z;
+            const nLen = Math.hypot(nx, nz) || 1;
+            const slideSign = dx * (-nz) + dz * nx >= 0 ? 1 : -1;
+            const slideStep = Math.min(dist, unit.speed * speedMult * dt * 0.7);
+            unit.x = clampCoord(unit.x + (-nz / nLen) * slideSign * slideStep);
+            unit.z = clampCoord(unit.z + (nx / nLen) * slideSign * slideStep);
           }
-          unit.targetX = unit.x;
-          unit.targetZ = unit.z;
         } else {
           const effectiveSpeed = unit.speed * speedMult * moatSlowMult;
           const step = Math.min(dist, effectiveSpeed * dt);
-          unit.x = quantize(
-            Math.max(-WORLD_HALF_SIZE + 2, Math.min(WORLD_HALF_SIZE - 2, unit.x + (dx / dist) * step))
-          );
-          unit.z = quantize(
-            Math.max(-WORLD_HALF_SIZE + 2, Math.min(WORLD_HALF_SIZE - 2, unit.z + (dz / dist) * step))
-          );
+          let sepX = 0;
+          let sepZ = 0;
+          for (let ni = 0; ni < scratchNearUnits.length; ni++) {
+            const other = scratchNearUnits[ni];
+            if (other.id === unit.id) continue;
+            const odx = unit.x - other.x;
+            const odz = unit.z - other.z;
+            const od = Math.hypot(odx, odz);
+            if (od > 0.05 && od < 1.35) {
+              const push = (1.35 - od) * 0.35;
+              sepX += (odx / od) * push;
+              sepZ += (odz / od) * push;
+            }
+          }
+          unit.x = clampCoord(unit.x + (dx / dist) * step + sepX * dt * 3);
+          unit.z = clampCoord(unit.z + (dz / dist) * step + sepZ * dt * 3);
           unit.rotationY = Math.round(Math.atan2(dx, dz) * 100) / 100;
         }
       } else {
@@ -4039,8 +5034,8 @@ async function startServer() {
         }
       }
 
-      // Authoritative Naval Transport Flag (unit switches to war galley on open water)
-      unit.isNaval = getTerrainHeight(unit.x, unit.z) < WATER_LEVEL_Y;
+      // Authoritative Deep-Water Naval Transport Flag
+      unit.isNaval = getTerrainHeight(unit.x, unit.z) < WATER_LEVEL_Y - 0.65;
 
       if (unit.state === 'repairing' && unit.assignedStructureId) {
         const repSt = worldState.structures[unit.assignedStructureId];
@@ -4188,8 +5183,9 @@ async function startServer() {
       const structsArr = Object.values(worldState.structures);
 
       const hasFriendlyCommander = (u: BlockoutUnit) => {
-        for (let i = 0; i < unitsArr.length; i++) {
-          const c = unitsArr[i];
+        queryNearbyUnits(u.x, u.z, 24, scratchNearUnits);
+        for (let i = 0; i < scratchNearUnits.length; i++) {
+          const c = scratchNearUnits[i];
           if (
             c.ownerId === u.ownerId &&
             c.kind === 'commander' &&
@@ -4345,8 +5341,9 @@ async function startServer() {
 
           let bestEnemyUnit: BlockoutUnit | undefined;
           let bestDist = scanR;
-          for (let j = 0; j < unitsArr.length; j++) {
-            const cand = unitsArr[j];
+          queryNearbyUnits(unit.x, unit.z, scanR, scratchNearUnits);
+          for (let j = 0; j < scratchNearUnits.length; j++) {
+            const cand = scratchNearUnits[j];
             if (!isHostileOwners(unit.ownerId, cand.ownerId) || cand.hp <= 0) continue;
             // Hidden forest bandits cannot be auto-targeted from afar until revealed!
             if (cand.isBanditUnit && cand.isStealthed) continue;
@@ -4402,8 +5399,12 @@ async function startServer() {
           !tUnit && unit.targetStructureId ? worldState.structures[unit.targetStructureId] : undefined;
 
         if (tUnit && tUnit.hp > 0) {
+          const trebuchetElevRange =
+            unit.kind === 'trebuchet' && getTerrainHeight(unit.x, unit.z) > getTerrainHeight(tUnit.x, tUnit.z) + 1.5
+              ? 4.0
+              : 0;
           const d = Math.hypot(tUnit.x - unit.x, tUnit.z - unit.z);
-          const effectiveRange = spec.rangeMeters + 0.6;
+          const effectiveRange = spec.rangeMeters + trebuchetElevRange + 0.6;
           if (d > effectiveRange) {
             if (stance !== 'stand') {
               unit.targetX = quantize(tUnit.x);
@@ -4438,8 +5439,30 @@ async function startServer() {
               }
 
               if (hasFriendlyCommander(unit)) rawDmg *= 1.25;
-              if (unit.kind === 'spearman' && (tUnit.kind === 'knight' || tUnit.kind === 'commander')) {
-                rawDmg *= 2.8;
+              if (unit.isHeroSultan) rawDmg *= 1.2;
+              if (unit.kind === 'spearman') {
+                if (tUnit.kind === 'knight' || tUnit.kind === 'commander') {
+                  rawDmg *= 3.0;
+                }
+                // Gate/Keep defense spear wall bonus (+25%)
+                const nearOwnGate = structsArr.some(
+                  (s) =>
+                    s.ownerId === unit.ownerId &&
+                    (s.kind === 'gatehouse' || s.kind === 'keep') &&
+                    Math.hypot(s.x - unit.x, s.z - unit.z) <= 10
+                );
+                if (nearOwnGate) rawDmg *= 1.25;
+                tUnit.slowUntilTick = worldState.tick + 60; // 3s hamstring slow
+              }
+              if (
+                (unit.kind === 'knight' || unit.kind === 'commander') &&
+                worldState.tick - (unit.lastChargeTick ?? -120) >= 100
+              ) {
+                unit.lastChargeTick = worldState.tick;
+                rawDmg *= 1.4; // Heavy Cavalry lance charge first-hit burst
+              }
+              if (unit.kind === 'archer') {
+                tUnit.burnUntilTick = worldState.tick + 80; // 4s Fire-Arrow burn DoT
               }
               if (
                 (unit.kind === 'knight' || unit.kind === 'commander') &&
@@ -4467,15 +5490,32 @@ async function startServer() {
               const dmg = Math.max(5, Math.round(rawDmg * mitigation));
               tUnit.hp = Math.max(0, tUnit.hp - dmg);
 
-              // Trebuchet fiery boulder splash damage around target impact!
+              // Trebuchet fiery boulder splash damage around target impact! (lethal)
               if (unit.kind === 'trebuchet') {
                 const splashDmg = Math.max(8, Math.round(dmg * 0.45));
-                for (let k = 0; k < unitsArr.length; k++) {
-                  const other = unitsArr[k];
+                queryNearbyUnits(tUnit.x, tUnit.z, 6, scratchNearUnits);
+                for (let k = 0; k < scratchNearUnits.length; k++) {
+                  const other = scratchNearUnits[k];
                   if (other.id === tUnit.id || other.hp <= 0) continue;
                   if (!isHostileOwners(unit.ownerId, other.ownerId)) continue;
                   if (Math.hypot(other.x - tUnit.x, other.z - tUnit.z) <= 5.5) {
-                    other.hp = Math.max(1, other.hp - splashDmg);
+                    other.hp = Math.max(0, other.hp - splashDmg);
+                    if (other.hp <= 0) {
+                      delete worldState.units[other.id];
+                      const attP = worldState.players[unit.ownerId];
+                      const defP = worldState.players[other.ownerId];
+                      if (attP) attP.kills = (attP.kills ?? 0) + 1;
+                      if (defP) defP.losses = (defP.losses ?? 0) + 1;
+                      recoverStolenLootOnDeath(other, unit.ownerId);
+                      pushCombatEvent({
+                        kind: 'destruction',
+                        fromX: other.x,
+                        fromZ: other.z,
+                        toX: other.x,
+                        toZ: other.z,
+                        targetOwnerId: other.ownerId,
+                      });
+                    }
                   }
                 }
               }
@@ -4695,8 +5735,9 @@ async function startServer() {
 
         let targetUnit: BlockoutUnit | undefined;
         let bestD = defSpec.rangeMeters * rangeMult;
-        for (let j = 0; j < unitsArr.length; j++) {
-          const u = unitsArr[j];
+        queryNearbyUnits(st.x, st.z, bestD, scratchNearUnits);
+        for (let j = 0; j < scratchNearUnits.length; j++) {
+          const u = scratchNearUnits[j];
           if (!isHostileOwners(st.ownerId, u.ownerId) || u.hp <= 0) continue;
           if (u.isBanditUnit && u.isStealthed) continue;
           const d = Math.hypot(u.x - st.x, u.z - st.z);
@@ -5440,7 +6481,51 @@ async function startServer() {
         }
       }
 
-      if (!clearedAnyBandit) {
+      // Evaluate Dominion Victory & PvP/PvE Match Outcome
+      if (worldState.matchStatus?.status !== 'ended') {
+        const keepCountByHuman: Record<string, number> = {};
+        for (const s of Object.values(worldState.structures)) {
+          if (s.kind === 'keep' && s.hp > 0 && worldState.players[s.ownerId] && !worldState.players[s.ownerId].isAi) {
+            keepCountByHuman[s.ownerId] = (keepCountByHuman[s.ownerId] ?? 0) + 1;
+          }
+        }
+        const humansAlive = Object.values(worldState.players).filter(
+          (p) => !p.isAi && !p.isBandit && !p.isDefeated
+        );
+        const targetKeeps = worldState.directorConfig?.dominionVictoryTargetCities ?? 6;
+        const dominionWinner = humansAlive.find((p) => (keepCountByHuman[p.id] ?? 0) >= targetKeeps);
+        const majorAiAlive = Object.values(worldState.players).some(
+          (p) => p.isAi && !p.isBandit && !p.isDefeated
+        );
+        const lastHumanWinner =
+          !majorAiAlive && humansAlive.length === 1 ? humansAlive[0] : undefined;
+
+        const matchWinner = dominionWinner ?? lastHumanWinner;
+        if (matchWinner) {
+          const reasonAr = dominionWinner
+            ? `سيطر ${matchWinner.factionName} على ${targetKeeps} قلاع ومدن كبرى في أرجاء المنطقة`
+            : `بقي ${matchWinner.factionName} صامداً ومنتصراً بعد سقوط القوى المعادية`;
+          const endedStatus: MatchStatusState = {
+            status: 'ended',
+            winnerPlayerId: matchWinner.id,
+            winnerNameAr: matchWinner.factionName,
+            victoryReasonAr: reasonAr,
+            endedAtMs: nowMs,
+          };
+          worldState.matchStatus = endedStatus;
+          for (const [pid, client] of clientSockets.entries()) {
+            sendPacket(client, 'S2C_MATCH_EVENT', {
+              outcome: pid === matchWinner.id ? 'victory' : 'defeat',
+              winnerPlayerId: matchWinner.id,
+              winnerNameAr: matchWinner.factionName,
+              reasonAr,
+            });
+          }
+          broadcastWorldSnapshot(`انتهت المعركة الكبرى: انتصار ${matchWinner.factionName}!`);
+        }
+      }
+
+      if (!clearedAnyBandit && worldState.directorConfig?.banditsEnabled !== false) {
         const humans = Object.values(worldState.players).filter((p) => !p.isAi && !p.isBandit);
         const anchorHuman = humans[0];
         const anchorKeep = anchorHuman
@@ -5494,7 +6579,7 @@ async function startServer() {
 
       st.activeBuildersCount = activeBuilders;
       const totalBuildSec = Math.max(6, st.buildTimeSeconds ?? STRUCTURE_SPECS[st.kind]?.buildTimeSeconds ?? 14);
-      const workerSpeedMult = activeBuilders > 0 ? 1 + (activeBuilders - 1) * 0.65 : 0.25;
+      const workerSpeedMult = activeBuilders > 0 ? 1 + (activeBuilders - 1) * 0.65 : 0.1;
       const progressStep = (100 / totalBuildSec) * workerSpeedMult * dt;
       const nextProgress = Math.min(100, (st.constructionProgress ?? 0) + progressStep);
       st.constructionProgress = Math.round(nextProgress * 10) / 10;
@@ -5787,10 +6872,13 @@ async function startServer() {
           serverTime: worldState.serverTime,
           climate: worldState.climate,
           autoCycleClimate: worldState.autoCycleClimate,
-          players: worldState.players,
+          players: sanitizePlayersForRecipient(pid),
           units: slice.units,
           pveTheater: worldState.pveTheater,
           combatEvents: slice.combatEvents,
+          diplomacy: worldState.diplomacy,
+          directorConfig: worldState.directorConfig,
+          matchStatus: worldState.matchStatus,
           ...(slice.structures ? { structures: slice.structures } : {}),
           ...(slice.resourceNodes ? { resourceNodes: slice.resourceNodes } : {}),
         });

@@ -3,7 +3,6 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import {
   type BespokeCityBlueprint,
   type CityAvenueSpec,
-  type CityCrowdHotspot,
   type CityMonumentKind,
   getBespokeCityBlueprintByPlateau,
 } from '../shared/cityBlueprints';
@@ -39,39 +38,9 @@ interface RingPath {
   isFullCircle: boolean;
 }
 
-interface CrowdAgent {
-  mode: 'segment' | 'ring' | 'hotspot';
-  segIdx: number;
-  ringIdx: number;
-  spotX: number;
-  spotZ: number;
-  spotRadius: number;
-  laneOffset: number;
-  t: number; // 0..1 along segment, or angle in radians for ring/hotspot
-  radialRatio: number;
-  speed: number;
-  dir: number;
-  phase: number;
-  scale: number;
-}
-
-interface CaravanAgent {
-  segIdx: number;
-  t: number;
-  laneOffset: number;
-  speed: number;
-  dir: number;
-  phase: number;
-  scale: number;
-}
-
 interface BuiltCityPlaza {
   plateau: SpawnPlateauEntry;
   group: THREE.Group;
-  crowdMesh: THREE.InstancedMesh | null;
-  caravanMesh: THREE.InstancedMesh | null;
-  agents: CrowdAgent[];
-  caravans: CaravanAgent[];
   walkSegments: WalkSegment[];
   ringPaths: RingPath[];
   outerR: number;
@@ -86,7 +55,7 @@ export interface HistoricCityQuartersSystem {
     originX: number,
     originZ: number,
     isPerspective3D: boolean,
-    cameraZoom: number
+    activeCityIndices?: ReadonlySet<number>
   ) => void;
   dispose: () => void;
 }
@@ -97,7 +66,6 @@ interface PlazaPalette {
   avenueStone: number;
   awningColors: number[];
   waterHex: number;
-  crowdRobes: number[];
 }
 
 const PLAZA_PALETTES: Record<CityUrbanStyle, PlazaPalette> = {
@@ -107,7 +75,6 @@ const PLAZA_PALETTES: Record<CityUrbanStyle, PlazaPalette> = {
     avenueStone: 0xd6bc92,
     awningColors: [0xb43e2d, 0xd8a346, 0x266a74, 0xe8dcc2, 0x7d3625],
     waterHex: 0x2a7686,
-    crowdRobes: [0xefe5d0, 0xc79558, 0x286b76, 0x993a2b, 0x5d4a36, 0xd9a954, 0x385742, 0xdccbb0],
   },
   levantine_shami: {
     cobbleMain: 0xb9afa0,
@@ -115,7 +82,6 @@ const PLAZA_PALETTES: Record<CityUrbanStyle, PlazaPalette> = {
     avenueStone: 0xd4cab8,
     awningColors: [0xa8382c, 0x2e6472, 0xd5a84e, 0xeee4d2, 0x5c7548],
     waterHex: 0x2c7a88,
-    crowdRobes: [0xf4ede0, 0xa23c2c, 0x355d70, 0x6b5842, 0xcda459, 0x486544, 0x8c7b6a, 0xe3d6c0],
   },
   hejazi_arabian: {
     cobbleMain: 0xd9c9af,
@@ -123,7 +89,6 @@ const PLAZA_PALETTES: Record<CityUrbanStyle, PlazaPalette> = {
     avenueStone: 0xe8ddc8,
     awningColors: [0xb84c28, 0xd8a64e, 0x2f685c, 0xf2e9d6],
     waterHex: 0x297b84,
-    crowdRobes: [0xf8f4ec, 0xe9dac0, 0x9e4824, 0x2d5e58, 0xcf9a4a, 0x5a4634, 0xdfd0b4],
   },
   bedouin_nomadic: {
     cobbleMain: 0xb9986b,
@@ -131,11 +96,8 @@ const PLAZA_PALETTES: Record<CityUrbanStyle, PlazaPalette> = {
     avenueStone: 0xcbad82,
     awningColors: [0x9e2d24, 0x3a2d26, 0xd19c48, 0xe8dcc4],
     waterHex: 0x2d7b82,
-    crowdRobes: [0xf1e6d2, 0x3a2e28, 0xa32e24, 0xcc9b52, 0x5d4c3c, 0xdcc6a0, 0x7c482e],
   },
 };
-
-const CARAVAN_TINTS = [0xc9a36f, 0xb88f59, 0xd6b583, 0x9e794c, 0xc29a66];
 
 const _tmpMat4 = new THREE.Matrix4();
 const _tmpPos = new THREE.Vector3();
@@ -233,70 +195,20 @@ function createSharedCityAssets() {
     flatShading: true,
   });
 
-  const crowdMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    roughness: 0.84,
-    metalness: 0.04,
-    flatShading: true,
-  });
-
-  const caravanMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    roughness: 0.88,
-    metalness: 0.04,
-    flatShading: true,
-  });
-
-  applyRetroPixelShader(pavingMat, { enableVisionFog: true });
+  applyRetroPixelShader(pavingMat, { enableVisionFog: true, enableOutline: false });
   applyRetroPixelShader(archMat, { enableVisionFog: true });
-  applyRetroPixelShader(waterMat, { enableVisionFog: true });
-  applyRetroPixelShader(crowdMat, { enableVisionFog: true });
-  applyRetroPixelShader(caravanMat, { enableVisionFog: true });
-
-  // Composite robed medieval townsfolk silhouette (robe + mantle + turbaned head)
-  const crowdParts: THREE.BufferGeometry[] = [];
-  pushColoredGeom(crowdParts, new THREE.CylinderGeometry(0.15, 0.26, 0.82, 5), null, 0, 0.41, 0);
-  pushColoredGeom(crowdParts, new THREE.BoxGeometry(0.34, 0.16, 0.22), null, 0, 0.74, 0);
-  pushColoredGeom(crowdParts, new THREE.CylinderGeometry(0.13, 0.15, 0.22, 5), null, 0, 0.96, 0);
-  const crowdGeom = mergeAndDispose(crowdParts) ?? new THREE.BoxGeometry(0.3, 1.05, 0.3);
-
-  // Composite pack-camel merchant caravan silhouette (body + hump + twin cargo packs + neck/head + legs)
-  const camelParts: THREE.BufferGeometry[] = [];
-  // Torso
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.54, 0.56, 1.25), null, 0, 0.88, 0);
-  // Hump
-  pushColoredGeom(camelParts, new THREE.ConeGeometry(0.28, 0.38, 5), null, 0, 1.32, -0.05);
-  // Twin woven spice/silk saddle packs
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.24, 0.42, 0.78), null, -0.36, 0.96, -0.04);
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.24, 0.42, 0.78), null, 0.36, 0.96, -0.04);
-  // Neck & head facing +Z
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.22, 0.62, 0.24), null, 0, 1.22, 0.62, 0, 0.36, 0);
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.24, 0.22, 0.42), null, 0, 1.48, 0.82);
-  // 4 legs
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.12, 0.64, 0.12), null, -0.18, 0.32, 0.42);
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.12, 0.64, 0.12), null, 0.18, 0.32, 0.42);
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.12, 0.64, 0.12), null, -0.18, 0.32, -0.44);
-  pushColoredGeom(camelParts, new THREE.BoxGeometry(0.12, 0.64, 0.12), null, 0.18, 0.32, -0.44);
-  const caravanGeom = mergeAndDispose(camelParts) ?? new THREE.BoxGeometry(0.8, 1.2, 1.6);
+  applyRetroPixelShader(waterMat, { enableVisionFog: true, enableOutline: false });
 
   return {
     pavingMat,
     archMat,
     waterMat,
     flameMat,
-    crowdMat,
-    caravanMat,
-    crowdGeom,
-    caravanGeom,
     dispose: () => {
       pavingMat.dispose();
       archMat.dispose();
       waterMat.dispose();
       flameMat.dispose();
-      crowdMat.dispose();
-      caravanMat.dispose();
-      crowdGeom.dispose();
-      caravanGeom.dispose();
     },
   };
 }
@@ -1389,7 +1301,6 @@ function buildHistoricCityPlaza(
         avenueStone: bp.customPalette.avenueStone,
         awningColors: bp.customPalette.awningColors,
         waterHex: bp.customPalette.waterHex ?? basePal.waterHex,
-        crowdRobes: basePal.crowdRobes,
       }
     : basePal;
 
@@ -1400,20 +1311,14 @@ function buildHistoricCityPlaza(
 
   const walkSegments: WalkSegment[] = [];
   const ringPaths: RingPath[] = [];
-  const hotspots: CityCrowdHotspot[] = [];
 
   const seedBase = Math.round(plateau.x * 0.13 + plateau.z * 0.29) + plateauIndex * 101;
   const centerGy = getTerrainHeight(plateau.x, plateau.z);
 
   let outerR = 22;
-  let crowdCount = 55;
-  let caravanCount = 3;
 
   if (bp) {
     outerR = bp.outerRadius;
-    crowdCount = bp.crowdCount;
-    caravanCount = bp.caravanCount;
-    hotspots.push(...bp.hotspots);
 
     if (centerGy >= WATER_LEVEL_Y + 0.3) {
       // 1. Central Civic Plaza Flagstones
@@ -1502,8 +1407,6 @@ function buildHistoricCityPlaza(
     // Non-AI Historic Regional Town (lively oasis/market town with awnings, fountain, trees & bustling locals)
     const pop = plateau.populationEst;
     outerR = pop >= 14000 ? 28 : pop >= 9000 ? 24 : 20;
-    crowdCount = pop >= 14000 ? 95 : pop >= 9000 ? 72 : 52;
-    caravanCount = pop >= 10000 ? 4 : 2;
 
     if (centerGy >= WATER_LEVEL_Y + 0.3) {
       if (style !== 'bedouin_nomadic') {
@@ -1561,11 +1464,6 @@ function buildHistoricCityPlaza(
         );
       }
       ringPaths.push({ radius: ringR, width: 2.4, arcStart: 0, arcEnd: Math.PI * 2, isFullCircle: true });
-      hotspots.push(
-        { x: 0, z: 0, radius: 7.5, weight: 2, kind: 'plaza' },
-        { x: 10, z: 0, radius: 5.5, weight: 2, kind: 'souq' },
-        { x: -10, z: 0, radius: 5.5, weight: 2, kind: 'souq' }
-      );
     }
   }
 
@@ -1602,157 +1500,11 @@ function buildHistoricCityPlaza(
     group.add(mesh);
   }
 
-  // ---------- Populate Living Instanced Citizens ----------
-  const agents: CrowdAgent[] = [];
-  let crowdMesh: THREE.InstancedMesh | null = null;
-  if (crowdCount > 0 && (walkSegments.length > 0 || ringPaths.length > 0 || hotspots.length > 0)) {
-    crowdMesh = new THREE.InstancedMesh(mats.crowdGeom, mats.crowdMat, crowdCount);
-    crowdMesh.castShadow = false;
-    crowdMesh.receiveShadow = false;
-    crowdMesh.frustumCulled = false;
-
-    const totalHotspotWeight = hotspots.reduce((acc, h) => acc + Math.max(0.5, h.weight), 0);
-    const pickHotspot = (r: number): CityCrowdHotspot => {
-      let acc = 0;
-      const target = r * totalHotspotWeight;
-      for (let i = 0; i < hotspots.length; i++) {
-        acc += Math.max(0.5, hotspots[i].weight);
-        if (target <= acc) return hotspots[i];
-      }
-      return hotspots[hotspots.length - 1];
-    };
-
-    for (let i = 0; i < crowdCount; i++) {
-      const r1 = hash2D(seedBase + i * 13, i * 29 + 7);
-      const r2 = hash2D(i * 41 - 11, seedBase + i * 19);
-      const r3 = hash2D(i * 7 + 53, seedBase - i * 31);
-      const r4 = hash2D(seedBase - i * 17, i * 61 + 3);
-
-      let mode: CrowdAgent['mode'] = 'segment';
-      if (hotspots.length > 0 && r4 > 0.56) {
-        mode = 'hotspot';
-      } else if (ringPaths.length > 0 && r4 > 0.38 && r4 <= 0.56) {
-        mode = 'ring';
-      } else if (walkSegments.length === 0) {
-        mode = ringPaths.length > 0 ? 'ring' : 'hotspot';
-      }
-
-      if (mode === 'segment') {
-        const segIdx = i % walkSegments.length;
-        const seg = walkSegments[segIdx];
-        agents.push({
-          mode: 'segment',
-          segIdx,
-          ringIdx: 0,
-          spotX: 0,
-          spotZ: 0,
-          spotRadius: 0,
-          laneOffset: (r1 - 0.5) * 2 * seg.halfWidth,
-          t: r3,
-          radialRatio: 0,
-          speed: (1.25 + r2 * 1.45) / Math.max(6, seg.len),
-          dir: r1 > 0.5 ? 1 : -1,
-          phase: r3 * Math.PI * 2,
-          scale: 0.84 + r2 * 0.28,
-        });
-      } else if (mode === 'ring') {
-        const ringIdx = i % ringPaths.length;
-        const ring = ringPaths[ringIdx];
-        const t = ring.arcStart + r3 * (ring.arcEnd - ring.arcStart);
-        agents.push({
-          mode: 'ring',
-          segIdx: 0,
-          ringIdx,
-          spotX: 0,
-          spotZ: 0,
-          spotRadius: 0,
-          laneOffset: (r1 - 0.5) * Math.max(1.2, ring.width * 0.85),
-          t,
-          radialRatio: 0,
-          speed: (1.2 + r2 * 1.1) / Math.max(6, ring.radius),
-          dir: r1 > 0.5 ? 1 : -1,
-          phase: r2 * Math.PI * 2,
-          scale: 0.84 + r1 * 0.28,
-        });
-      } else {
-        const spot = pickHotspot(r1);
-        agents.push({
-          mode: 'hotspot',
-          segIdx: 0,
-          ringIdx: 0,
-          spotX: spot.x,
-          spotZ: spot.z,
-          spotRadius: spot.radius,
-          laneOffset: (r2 - 0.5) * 1.2,
-          t: r3 * Math.PI * 2,
-          radialRatio: 0.24 + Math.sqrt(r2) * 0.76,
-          speed: 0.22 + r1 * 0.35,
-          dir: r2 > 0.5 ? 1 : -1,
-          phase: r3 * Math.PI * 2,
-          scale: 0.82 + r4 * 0.28,
-        });
-      }
-
-      const robeHex = pal.crowdRobes[i % pal.crowdRobes.length];
-      _tmpColor.setHex(robeHex);
-      crowdMesh.setColorAt(i, _tmpColor);
-    }
-
-    if (crowdMesh.instanceColor) {
-      crowdMesh.instanceColor.needsUpdate = true;
-    }
-    group.add(crowdMesh);
-  }
-
-  // ---------- Populate Living Instanced Merchant Caravans ----------
-  const caravans: CaravanAgent[] = [];
-  let caravanMesh: THREE.InstancedMesh | null = null;
-  if (caravanCount > 0 && walkSegments.length > 0) {
-    // Prefer the longest main trade avenues for pack-camel caravans
-    const sortedSegIndices = walkSegments
-      .map((s, idx) => ({ idx, len: s.len }))
-      .sort((a, b) => b.len - a.len)
-      .slice(0, Math.min(4, walkSegments.length))
-      .map((x) => x.idx);
-
-    caravanMesh = new THREE.InstancedMesh(mats.caravanGeom, mats.caravanMat, caravanCount);
-    caravanMesh.castShadow = false;
-    caravanMesh.receiveShadow = false;
-    caravanMesh.frustumCulled = false;
-
-    for (let c = 0; c < caravanCount; c++) {
-      const segIdx = sortedSegIndices[c % sortedSegIndices.length];
-      const seg = walkSegments[segIdx];
-      const r1 = hash2D(seedBase + c * 31, c * 47 + 9);
-      const r2 = hash2D(c * 23 + 17, seedBase - c * 19);
-      caravans.push({
-        segIdx,
-        t: r1,
-        laneOffset: (r2 > 0.5 ? 1 : -1) * Math.min(1.1, seg.halfWidth * 0.45),
-        speed: (1.55 + r2 * 0.7) / Math.max(12, seg.len),
-        dir: r2 > 0.5 ? 1 : -1,
-        phase: r1 * Math.PI * 2,
-        scale: 0.92 + r1 * 0.16,
-      });
-
-      _tmpColor.setHex(CARAVAN_TINTS[c % CARAVAN_TINTS.length]);
-      caravanMesh.setColorAt(c, _tmpColor);
-    }
-    if (caravanMesh.instanceColor) {
-      caravanMesh.instanceColor.needsUpdate = true;
-    }
-    group.add(caravanMesh);
-  }
-
   group.visible = false;
 
   return {
     plateau,
     group,
-    crowdMesh,
-    caravanMesh,
-    agents,
-    caravans,
     walkSegments,
     ringPaths,
     outerR,
@@ -1765,22 +1517,18 @@ export function createHistoricCityQuartersSystem(
 ): HistoricCityQuartersSystem {
   const mats = createSharedCityAssets();
   const builtCities = new Map<number, BuiltCityPlaza>();
-  const dummy = new THREE.Object3D();
-  let animClock = 0;
 
   const update = (
-    delta: number,
+    _delta: number,
     centerWorldX: number,
     centerWorldZ: number,
     originX: number,
     originZ: number,
     isPerspective3D: boolean,
-    cameraZoom: number
+    activeCityIndices?: ReadonlySet<number>
   ) => {
-    animClock += delta;
     const loadRadius = isPerspective3D ? 1750 : 1250;
     const hideRadius = isPerspective3D ? 2150 : 1550;
-    const showCrowd = cameraZoom < 165;
 
     let builtThisFrame = 0;
 
@@ -1788,6 +1536,15 @@ export function createHistoricCityQuartersSystem(
       const plateau = SPAWN_PLATEAUS[i];
       const dist = Math.hypot(plateau.x - centerWorldX, plateau.z - centerWorldZ);
       let entry = builtCities.get(i);
+      const isOccupied = !activeCityIndices || activeCityIndices.has(i);
+
+      if (!isOccupied) {
+        if (entry && entry.isVisible) {
+          entry.isVisible = false;
+          entry.group.visible = false;
+        }
+        continue;
+      }
 
       if (!entry) {
         if (dist < loadRadius && builtThisFrame < 1) {
@@ -1814,124 +1571,13 @@ export function createHistoricCityQuartersSystem(
       }
 
       entry.group.position.set(plateau.x - originX, 0, plateau.z - originZ);
-
-      const shouldAnimateLife = showCrowd && dist < 390;
-
-      // Update dense animated citizen crowds
-      if (entry.crowdMesh) {
-        entry.crowdMesh.visible = shouldAnimateLife;
-        if (shouldAnimateLife) {
-          const agents = entry.agents;
-          const segs = entry.walkSegments;
-          const rings = entry.ringPaths;
-
-          for (let a = 0; a < agents.length; a++) {
-            const ag = agents[a];
-            let lx = 0;
-            let lz = 0;
-            let rotY = 0;
-
-            if (ag.mode === 'segment') {
-              const seg = segs[ag.segIdx];
-              ag.t += ag.speed * ag.dir * delta;
-              if (ag.t > 1) {
-                ag.t = 1;
-                ag.dir = -1;
-              } else if (ag.t < 0) {
-                ag.t = 0;
-                ag.dir = 1;
-              }
-              lx = seg.ax + (seg.bx - seg.ax) * ag.t + seg.nx * ag.laneOffset;
-              lz = seg.az + (seg.bz - seg.az) * ag.t + seg.nz * ag.laneOffset;
-              rotY = Math.atan2(seg.ux * ag.dir, seg.uz * ag.dir);
-            } else if (ag.mode === 'ring') {
-              const ring = rings[ag.ringIdx];
-              ag.t += ag.speed * ag.dir * delta;
-              if (ring.isFullCircle) {
-                if (ag.t > Math.PI * 2) ag.t -= Math.PI * 2;
-                if (ag.t < 0) ag.t += Math.PI * 2;
-              } else {
-                const lo = Math.min(ring.arcStart, ring.arcEnd);
-                const hi = Math.max(ring.arcStart, ring.arcEnd);
-                if (ag.t > hi) {
-                  ag.t = hi;
-                  ag.dir = -1;
-                } else if (ag.t < lo) {
-                  ag.t = lo;
-                  ag.dir = 1;
-                }
-              }
-              const rad = ring.radius + ag.laneOffset;
-              lx = Math.cos(ag.t) * rad;
-              lz = Math.sin(ag.t) * rad;
-              rotY = -ag.t + (ag.dir > 0 ? 0 : Math.PI);
-            } else {
-              // Bustling souq / mosque / harbor / gate crowd circulation
-              ag.t += ag.speed * ag.dir * delta;
-              const rad =
-                ag.spotRadius *
-                ag.radialRatio *
-                (0.84 + 0.16 * Math.sin(animClock * 0.7 + ag.phase));
-              lx = ag.spotX + Math.cos(ag.t) * rad;
-              lz = ag.spotZ + Math.sin(ag.t) * rad;
-              rotY = -ag.t + (ag.dir > 0 ? 0 : Math.PI);
-            }
-
-            const gy = getTerrainHeight(plateau.x + lx, plateau.z + lz);
-            const bob = Math.abs(Math.sin(animClock * 7.8 + ag.phase)) * 0.085;
-            dummy.position.set(lx, gy + bob, lz);
-            dummy.rotation.set(0, rotY, 0);
-            dummy.scale.set(ag.scale, ag.scale, ag.scale);
-            dummy.updateMatrix();
-            entry.crowdMesh.setMatrixAt(a, dummy.matrix);
-          }
-          entry.crowdMesh.instanceMatrix.needsUpdate = true;
-        }
-      }
-
-      // Update animated pack-camel trade caravans
-      if (entry.caravanMesh) {
-        entry.caravanMesh.visible = shouldAnimateLife;
-        if (shouldAnimateLife) {
-          const caravans = entry.caravans;
-          const segs = entry.walkSegments;
-          for (let c = 0; c < caravans.length; c++) {
-            const cv = caravans[c];
-            const seg = segs[cv.segIdx];
-            cv.t += cv.speed * cv.dir * delta;
-            if (cv.t > 1) {
-              cv.t = 1;
-              cv.dir = -1;
-            } else if (cv.t < 0) {
-              cv.t = 0;
-              cv.dir = 1;
-            }
-            const lx = seg.ax + (seg.bx - seg.ax) * cv.t + seg.nx * cv.laneOffset;
-            const lz = seg.az + (seg.bz - seg.az) * cv.t + seg.nz * cv.laneOffset;
-            const rotY = Math.atan2(seg.ux * cv.dir, seg.uz * cv.dir);
-            const gy = getTerrainHeight(plateau.x + lx, plateau.z + lz);
-            const gaitBob = Math.abs(Math.sin(animClock * 4.4 + cv.phase)) * 0.07;
-            const gaitSway = Math.sin(animClock * 4.4 + cv.phase) * 0.045;
-            dummy.position.set(lx, gy + gaitBob, lz);
-            dummy.rotation.set(0, rotY, gaitSway);
-            dummy.scale.set(cv.scale, cv.scale, cv.scale);
-            dummy.updateMatrix();
-            entry.caravanMesh.setMatrixAt(c, dummy.matrix);
-          }
-          entry.caravanMesh.instanceMatrix.needsUpdate = true;
-        }
-      }
     }
   };
 
   const dispose = () => {
     for (const entry of builtCities.values()) {
       entry.group.traverse((child) => {
-        if (
-          (child as THREE.Mesh).geometry &&
-          child !== entry.crowdMesh &&
-          child !== entry.caravanMesh
-        ) {
+        if ((child as THREE.Mesh).geometry) {
           (child as THREE.Mesh).geometry.dispose();
         }
       });

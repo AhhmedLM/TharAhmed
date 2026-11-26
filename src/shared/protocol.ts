@@ -7,7 +7,10 @@ export type PacketType =
   | 'C2S_PLACE_STRUCTURE'
   | 'C2S_PLACE_FORT_BATCH'
   | 'C2S_UPGRADE_STRUCTURE'
+  | 'C2S_DEMOLISH_STRUCTURE'
   | 'C2S_SPAWN_UNIT'
+  | 'C2S_QUEUE_UNIT'
+  | 'C2S_CANCEL_TRAINING'
   | 'C2S_MOVE_UNITS'
   | 'C2S_ATTACK_TARGET'
   | 'C2S_UNIT_STANCE'
@@ -20,12 +23,15 @@ export type PacketType =
   | 'C2S_SET_CLIMATE'
   | 'C2S_SET_CULTURE'
   | 'C2S_TOGGLE_GATE'
+  | 'C2S_DIPLOMACY_ACTION'
+  | 'C2S_CLAIM_ROLE'
   | 'C2S_RESET_WORLD'
   | 'S2C_WELCOME'
   | 'S2C_PONG'
   | 'S2C_STATE_DELTA'
   | 'S2C_WORLD_SNAPSHOT'
-  | 'S2C_PACKET_ACK';
+  | 'S2C_PACKET_ACK'
+  | 'S2C_MATCH_EVENT';
 
 export type CultureKind =
   | 'iraqi_mesopotamian'
@@ -215,8 +221,41 @@ export interface CarriedLoot {
 
 export type AiFactionKind = 'sindhi_state' | 'crusaders' | 'local_emirate' | 'bandits';
 
+export type DiplomacyRelation = 'war' | 'neutral' | 'ally';
+export type PvpMode = 'diplomacy' | 'free_for_all' | 'coop';
+export type SultanHassanMode = 'ai_ruler' | 'human_claimable' | 'disabled';
+
+export interface TrainingQueueItem {
+  id: string;
+  unitKind: UnitKind;
+  campId: string;
+  durationSec: number;
+  remainingSec: number;
+  ownerId: string;
+}
+
+export interface WorldDirectorConfig {
+  pvpMode: PvpMode;
+  sultanHassanMode: SultanHassanMode;
+  sultanHassanAssignedUid: string | null;
+  enabledCities: Record<string, boolean>;
+  banditsEnabled: boolean;
+  banditDifficulty: PveDifficulty;
+  banditCampCount: number;
+  dominionVictoryTargetCities: number;
+}
+
+export interface MatchStatusState {
+  status: 'active' | 'ended';
+  winnerPlayerId?: string;
+  winnerNameAr?: string;
+  victoryReasonAr?: string;
+  endedAtMs?: number;
+}
+
 export interface PlayerState {
   id: string;
+  uid?: string;
   name: string;
   color: string;
   secondaryColor?: string;
@@ -234,14 +273,19 @@ export interface PlayerState {
   packetsSent: number;
   isAi?: boolean;
   isBandit?: boolean;
+  isSultanHassan?: boolean;
+  roleId?: 'sultan_hassan' | 'standard';
   aiFactionKind?: AiFactionKind;
   banditCampArchetype?: BanditCampArchetype;
   isDefeated?: boolean;
   defeatedAtMs?: number;
+  disconnectedAtMs?: number;
   aiDifficulty?: PveDifficulty;
   kills?: number;
   losses?: number;
   structuresRazed?: number;
+  capturedCapitals?: number;
+  trainingQueue?: TrainingQueueItem[];
 }
 
 export interface BlockoutStructure {
@@ -266,6 +310,8 @@ export interface BlockoutStructure {
   lastAttackTick?: number;
   isGateLocked?: boolean;
   isWaterMoat?: boolean;
+  burnUntilTick?: number;
+  burnAttackerId?: string;
 }
 
 export type CitizenRoleKind =
@@ -326,6 +372,13 @@ export interface BlockoutUnit {
   ambushBonusUntilTick?: number;
   carriedLoot?: CarriedLoot;
   ambushAnchor?: MarchWaypoint;
+  burnUntilTick?: number;
+  burnAttackerId?: string;
+  slowUntilTick?: number;
+  lastChargeTick?: number;
+  movedMetersSinceCharge?: number;
+  isHeroSultan?: boolean;
+  displayNameAr?: string;
 }
 
 export interface ResourceNode {
@@ -384,6 +437,13 @@ export interface WorldState {
   resourceNodes: Record<string, ResourceNode>;
   pveTheater?: PveTheaterState;
   combatEvents?: CombatEvent[];
+  diplomacy?: Record<string, DiplomacyRelation>;
+  directorConfig?: WorldDirectorConfig;
+  pendingAlliances?: Array<{ fromId: string; toId: string; createdAtMs: number }>;
+  pvpMode?: PvpMode;
+  sultanHassanMode?: SultanHassanMode;
+  sultanHassanOwnerId?: string | null;
+  matchStatus?: MatchStatusState;
 }
 
 export interface NetworkPacket<T = unknown> {
@@ -1830,7 +1890,12 @@ export function evaluatePopulationLife(
 
   // 5. Garrison Security & Town Patrols (0..100) + Royal Commander Presence
   const militaryUnits = units.filter(
-    (u) => u.kind === 'infantry' || u.kind === 'knight' || u.kind === 'commander'
+    (u) =>
+      u.kind === 'infantry' ||
+      u.kind === 'spearman' ||
+      u.kind === 'archer' ||
+      u.kind === 'knight' ||
+      u.kind === 'commander'
   );
   const hasCommander = units.some((u) => u.kind === 'commander');
   const safetyGuardScore = Math.min(
@@ -2047,21 +2112,21 @@ export function evaluateKingdomCapacity(
 
   const sellGoldPer100 =
     highestMarketLevel >= 3
-      ? 88
-      : highestMarketLevel === 2
-        ? 75
-        : highestMarketLevel === 1
-          ? 65
-          : 55;
-
-  const buyGoldPer100 =
-    highestMarketLevel >= 3
-      ? 55
+      ? 75
       : highestMarketLevel === 2
         ? 65
         : highestMarketLevel === 1
-          ? 75
-          : 85;
+          ? 55
+          : 45;
+
+  const buyGoldPer100 =
+    highestMarketLevel >= 3
+      ? 88
+      : highestMarketLevel === 2
+        ? 95
+        : highestMarketLevel === 1
+          ? 105
+          : 115;
 
   return {
     maxPopulation,

@@ -40,9 +40,11 @@ export interface WorldTerrainBundle {
       originZ: number,
       cameraYaw?: number,
       cameraZoom?: number,
-      isPerspective3D?: boolean
+      isPerspective3D?: boolean,
+      activeCityIndices?: ReadonlySet<number>
     ) => void;
   };
+  dispose: () => void;
 }
 
 interface TerrainChunkEntry {
@@ -68,7 +70,6 @@ const cShallowLagoon = new THREE.Color(0x0e7490);
 const cWetSand = new THREE.Color(0xc29b59);
 const cGoldenBeachSand = new THREE.Color(0xe5c285);
 const cRiverMudLoam = new THREE.Color(0x5e4a32);
-const cDirtSoil = new THREE.Color(0x9a7d58);
 const cRoadTrack = new THREE.Color(0xb08a5d);
 const cDrySteppeTan = new THREE.Color(0xc8ae84);
 const cPaleDesertSand = new THREE.Color(0xdcc296);
@@ -417,7 +418,7 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
     metalness: 0.04,
     flatShading: true,
   });
-  applyRetroPixelShader(terrainMat, { enableVisionFog: true });
+  applyRetroPixelShader(terrainMat, { enableVisionFog: true, enableOutline: false });
 
   const coarseSurfaceTexture = createContinentalSurfaceTexture(renderer, 192);
   const coarseMat = new THREE.MeshStandardMaterial({
@@ -430,7 +431,7 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
     polygonOffsetFactor: 1,
     polygonOffsetUnits: 1,
   });
-  applyRetroPixelShader(coarseMat, { enableVisionFog: true });
+  applyRetroPixelShader(coarseMat, { enableVisionFog: true, enableOutline: false });
 
   // Sculpted composite multi-part geological rock crag & talus boulder cluster (grounded deeply below y=0)
   const buildSculptedOutcropGeom = (): THREE.BufferGeometry => {
@@ -491,7 +492,7 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
     metalness: 0.05,
     flatShading: true,
   });
-  applyRetroPixelShader(outerOceanMat, { enableVisionFog: true });
+  applyRetroPixelShader(outerOceanMat, { enableVisionFog: true, enableOutline: false });
 
   const outerOceanBed = new THREE.Mesh(
     new THREE.PlaneGeometry(22000, 22000),
@@ -512,7 +513,7 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
     opacity: 0.88,
     flatShading: true,
   });
-  applyRetroPixelShader(waterMaterial, { enableVisionFog: true });
+  applyRetroPixelShader(waterMaterial, { enableVisionFog: true, enableOutline: false });
 
   const waterPlane = new THREE.Mesh(new THREE.PlaneGeometry(21600, 21600), waterMaterial);
   waterPlane.rotation.x = -Math.PI / 2;
@@ -1173,7 +1174,8 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
     originZ: number,
     cameraYaw = Math.PI / 4,
     cameraZoom = 38,
-    isPerspective3D = false
+    isPerspective3D = false,
+    activeCityIndices?: ReadonlySet<number>
   ) => {
     frameCounter += 1;
     const camSx = Math.floor(centerWorldX / CHUNK_SIZE);
@@ -1384,7 +1386,7 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
       originX,
       originZ,
       isPerspective3D,
-      cameraZoom
+      activeCityIndices
     );
 
     // Staggered billboard yaw updates are already handled in the nearChunks loop above
@@ -1477,6 +1479,52 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
     pAttr.needsUpdate = true;
   };
 
+  const dispose = () => {
+    for (const entry of nearChunks.values()) disposeChunk(entry);
+    nearChunks.clear();
+    for (const entry of horizonChunks.values()) disposeChunk(entry);
+    horizonChunks.clear();
+    terrainMeshes.length = 0;
+
+    historicCityQuarters.dispose();
+
+    waterfallAnchors.forEach((wf) => {
+      wf.group.traverse((child) => {
+        if ((child as THREE.Mesh).geometry && (child as THREE.Mesh).geometry !== foamRingGeom) {
+          (child as THREE.Mesh).geometry.dispose();
+        }
+      });
+      root.remove(wf.group);
+    });
+    bridgeAnchors.forEach((br) => {
+      br.group.traverse((child) => {
+        if ((child as THREE.Mesh).geometry) (child as THREE.Mesh).geometry.dispose();
+      });
+      root.remove(br.group);
+    });
+
+    outerOceanBed.geometry.dispose();
+    outerOceanMat.dispose();
+    waterPlane.geometry.dispose();
+    waterMaterial.dispose();
+    pixelWaterTex.dispose();
+    surfaceTexture.dispose();
+    coarseSurfaceTexture.dispose();
+    terrainMat.dispose();
+    coarseMat.dispose();
+    rockGeom.dispose();
+    rockMat.dispose();
+    skyDomeGeom.dispose();
+    skyDomeMat.dispose();
+    waterfallTex.dispose();
+    waterfallMat.dispose();
+    foamRingGeom.dispose();
+    foamRingMat.dispose();
+    bridgeMat.dispose();
+    particleGeom.dispose();
+    particleMat.dispose();
+  };
+
   return {
     root,
     terrainMeshes,
@@ -1486,5 +1534,6 @@ export function buildWorldTerrain(renderer: THREE.WebGLRenderer): WorldTerrainBu
       points: weatherPoints,
       update: updateWeatherAndChunks,
     },
+    dispose,
   };
 }

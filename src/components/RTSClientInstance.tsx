@@ -15,7 +15,7 @@ import {
   CloudSnow,
   Compass,
   Crosshair,
-  Eye,
+  Crown,
   Flag,
   Grid3X3,
   Hammer,
@@ -65,7 +65,6 @@ import {
   evaluateKingdomCapacity,
   evaluateKingdomUrbanization,
   evaluatePopulationLife,
-  getClimateVisionMultiplier,
   getRecommendedCultureForBiome,
   getStructureDefenseSpec,
   getStructureUpgradeRequirement,
@@ -93,21 +92,22 @@ import {
   formatDurationAr,
   formatWorldCoordKm,
   getBiomeAt,
-  getClimateZoneLabelAr,
   getEffectiveClimateAt,
-  getMoistureAt,
   getTemperatureCAt,
+  SPAWN_PLATEAUS,
   WORLD_MAP_SIZE,
 } from '../shared/worldMap';
 import {
   FortPlacementItem,
   isLineBuildableFort,
 } from '../shared/fortificationHelpers';
+import { getBespokeCityBlueprintByPlateau } from '../shared/cityBlueprints';
 import {
   BuildGridNudgeCommand,
   BuildPreviewStatus,
   CameraPresetCommand,
   CameraProjectionMode,
+  HoveredEntityInfo,
   HoverTerrainInfo,
   PixelScaleMode,
   RenderPerfStats,
@@ -121,9 +121,9 @@ import {
 } from './ProceduralStrategicMap';
 import {
   isTrainingCampStructure,
-  QueuedTrainingItem,
   SoldierTrainingCampPanel,
 } from './SoldierTrainingCampPanel';
+import { AdminDirectorModal } from './AdminDirectorModal';
 import {
   BrassCornerMountSvg,
   ChiseledSeparatorSvg,
@@ -529,13 +529,16 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     worldState,
     worldRef,
     lastAckMessage,
-    bytesPerSec,
+    matchEvent,
+    clearMatchEvent,
     syncCamera,
     placeStructure,
     placeFortBatch,
     setCulture,
     upgradeStructure,
-    spawnUnit,
+    demolishStructure,
+    queueUnit,
+    cancelTraining,
     moveUnits,
     dispatchAtlasMarch,
     attackTarget,
@@ -545,6 +548,8 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     deployPveFronts,
     reclaimKeep,
     tradeResource,
+    sendDiplomacyAction,
+    claimRole,
     resetWorld,
     setClimate,
     hydrateFromCloud,
@@ -599,15 +604,15 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
   const [placementCultureOverride, setPlacementCultureOverride] =
     useState<CultureKind | null>(null);
   const [autoMatchBiomeCulture, setAutoMatchBiomeCulture] = useState<boolean>(false);
-  const [convertExistingOnCultureChange, setConvertExistingOnCultureChange] = useState(false);
   const [touchMode, setTouchMode] = useState<TouchInteractionMode>('pan');
   const [qualityMode, setQualityMode] = useState<RenderQualityMode>('balanced');
   const [pixelScale, setPixelScale] = useState<PixelScaleMode>(2);
   const [projectionMode, setProjectionMode] =
     useState<CameraProjectionMode>('isometric_2000s');
   const [activePopup, setActivePopup] = useState<PopupModalKind>(null);
+  const [adminModalOpen, setAdminModalOpen] = useState<boolean>(false);
+  const [hoveredEntity, setHoveredEntity] = useState<HoveredEntityInfo | null>(null);
   const [buildCategory, setBuildCategory] = useState<BuildCategoryTab>('all');
-  const [trainingQueue, setTrainingQueue] = useState<QueuedTrainingItem[]>([]);
   const [requestedTrainingUnitKind, setRequestedTrainingUnitKind] =
     useState<UnitKind | null>(null);
   const lastBuildTapRef = useRef<{ kind: StructureKind; time: number } | null>(null);
@@ -776,7 +781,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
   useEffect(() => {
     if (myPlayer && !heraldryInitRef.current) {
       heraldryInitRef.current = true;
-      setCustomKingdomName(myPlayer.name || 'مملكة الحصون');
+      setCustomKingdomName(myPlayer.name || 'مملكة ثار أحمد');
       setCustomPrimaryColor(myPlayer.color || '#0d9488');
       setCustomSecondaryColor(myPlayer.secondaryColor || '#fbbf24');
       setCustomBannerPattern(myPlayer.bannerPattern || 'crescent_star');
@@ -790,7 +795,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
       secondaryColor?: string;
       bannerPattern?: BannerPatternKind;
     }) => {
-      const nextName = (overrides?.name ?? customKingdomName).trim() || myPlayer?.name || 'قائد الحصون';
+      const nextName = (overrides?.name ?? customKingdomName).trim() || myPlayer?.name || 'قائد ثار أحمد';
       const nextPrimary = overrides?.primaryColor ?? customPrimaryColor;
       const nextSecondary = overrides?.secondaryColor ?? customSecondaryColor;
       const nextPattern = overrides?.bannerPattern ?? customBannerPattern;
@@ -869,12 +874,18 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     [myUnits]
   );
 
+  const trainingQueue = useMemo(() => myPlayer?.trainingQueue ?? [], [myPlayer?.trainingQueue]);
+
+  useEffect(() => {
+    if (!matchEvent) return;
+    if (matchEvent.outcome === 'victory') {
+      soundFx.playVictoryFanfare();
+    } else {
+      soundFx.playDefeatToll();
+    }
+  }, [matchEvent]);
+
   const pveInfo = worldState?.pveTheater;
-  const pveElapsedSec = useMemo(() => {
-    if (!pveInfo) return 0;
-    const nowMs = worldState?.serverTime ?? Date.now();
-    return Math.max(0, Math.floor((nowMs - pveInfo.startedAtMs) / 1000));
-  }, [pveInfo, worldState?.serverTime]);
 
   const activeClimateId: ClimateKind = worldState?.climate ?? 'temperate_clear';
   const activeClimate = CLIMATE_SPECS[activeClimateId] ?? CLIMATE_SPECS.temperate_clear;
@@ -889,14 +900,6 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
   const hoverTempC = useMemo(
     () => getTemperatureCAt(hoverTerrain.x, hoverTerrain.z, Math.max(0, hoverTerrain.elevation)),
     [hoverTerrain.x, hoverTerrain.z, hoverTerrain.elevation]
-  );
-  const hoverHumidityPct = useMemo(
-    () => Math.round(getMoistureAt(hoverTerrain.x, hoverTerrain.z) * 100),
-    [hoverTerrain.x, hoverTerrain.z]
-  );
-  const hoverClimateZoneAr = useMemo(
-    () => getClimateZoneLabelAr(hoverTerrain.x, hoverTerrain.z),
-    [hoverTerrain.x, hoverTerrain.z]
   );
 
   const activeCulture: CultureKind = normalizeCultureKind(myPlayer?.culture ?? selectedCulture);
@@ -1090,6 +1093,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
 
     const resourceNodesMap = worldState?.resourceNodes ?? {};
     for (const u of myUnits) {
+      if (u.kind !== 'worker') continue;
       if (u.state === 'gathering' && u.assignedResourceId) {
         const rNode = resourceNodesMap[u.assignedResourceId];
         if (rNode && rNode.amount > 0) {
@@ -1392,7 +1396,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
   const handleSelectCulture = (culture: CultureKind) => {
     setSelectedCulture(culture);
     setPlacementCultureOverride(culture);
-    setCulture(culture, convertExistingOnCultureChange);
+    setCulture(culture, false);
     setTimeout(() => {
       saveCurrentWorldToCloud();
     }, 350);
@@ -1463,9 +1467,9 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
       };
     });
     placeFortBatch(enriched);
-    enriched.forEach((it) => {
-      persistPlacedStructure(it.kind, it.x, it.z, it.rotationY, it.culture);
-    });
+    setTimeout(() => {
+      saveCurrentWorldToCloud();
+    }, 400);
   };
 
   const handleUpgradeStructure = (structureId: string) => {
@@ -1477,35 +1481,11 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
 
   const handleSpawnUnit = useCallback(
     (kind: UnitKind, structureId?: string) => {
-      spawnUnit(kind, structureId);
+      queueUnit(kind, structureId);
       persistSpawnedUnit(kind);
     },
-    [spawnUnit, persistSpawnedUnit]
+    [queueUnit, persistSpawnedUnit]
   );
-
-  // Advance lifted training queue continuously even if Training Camp panel is closed
-  useEffect(() => {
-    if (trainingQueue.length === 0) return;
-    const timer = window.setInterval(() => {
-      setTrainingQueue((prev) => {
-        if (prev.length === 0) return prev;
-        const head = prev[0];
-        const nextElapsed = head.elapsedSec + 0.1;
-        if (nextElapsed >= head.durationSec) {
-          handleSpawnUnit(head.unitKind, head.campId);
-          return prev.slice(1);
-        }
-        return [
-          {
-            ...head,
-            elapsedSec: nextElapsed,
-          },
-          ...prev.slice(1),
-        ];
-      });
-    }, 100);
-    return () => window.clearInterval(timer);
-  }, [trainingQueue.length, handleSpawnUnit]);
 
   const selectPrimaryTrainingCamp = useCallback(
     (preferredKinds?: StructureKind[], focusUnitKind?: UnitKind) => {
@@ -1562,16 +1542,15 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     const refX = myKeep?.x ?? 0;
     const refZ = myKeep?.z ?? 0;
 
+    const workers = myUnits.filter((u) => u.kind === 'worker');
     const candidateUnit =
-      myUnits.find((u) => u.kind === 'worker' && u.state === 'idle') ||
-      myUnits.find((u) => u.state === 'idle') ||
-      myUnits.find(
+      workers.find((u) => u.state === 'idle') ||
+      workers.find(
         (u) =>
-          u.kind === 'worker' &&
-          (!u.assignedResourceId ||
-            worldState.resourceNodes[u.assignedResourceId]?.kind !== kind)
+          !u.assignedResourceId ||
+          worldState.resourceNodes[u.assignedResourceId]?.kind !== kind
       ) ||
-      myUnits[0];
+      workers[0];
 
     if (!candidateUnit) return;
 
@@ -1596,11 +1575,12 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
     }
   };
 
-  // Auto-distribute all idle units across the 5 resource kinds
+  // Auto-distribute all idle workers across the 6 resource kinds
   const autoDistributeIdleUnits = () => {
     if (!worldState) return;
-    const idleUnits = myUnits.filter((u) => u.state === 'idle');
-    const pool = idleUnits.length > 0 ? idleUnits : myUnits.filter((u) => u.kind === 'worker');
+    const workers = myUnits.filter((u) => u.kind === 'worker');
+    const idleWorkers = workers.filter((u) => u.state === 'idle');
+    const pool = idleWorkers.length > 0 ? idleWorkers : workers;
     if (pool.length === 0) return;
 
     const kindsOrder: ResourceKind[] = ['wood', 'food', 'cloth', 'horses', 'stone', 'gold'];
@@ -1628,14 +1608,15 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
   };
 
   const dispatchWorkersToSpecificNode = (node: ResourceNode) => {
+    const workers = myUnits.filter((u) => u.kind === 'worker');
     const chosenUnits =
       selectedUnitIds.length > 0
         ? selectedUnitIds
-        : myUnits.filter((u) => u.state === 'idle').map((u) => u.id);
+        : workers.filter((u) => u.state === 'idle').map((u) => u.id);
     const finalIds =
       chosenUnits.length > 0
         ? chosenUnits
-        : myUnits.slice(0, Math.min(2, myUnits.length)).map((u) => u.id);
+        : workers.slice(0, Math.min(2, workers.length)).map((u) => u.id);
 
     if (finalIds.length > 0) {
       handleMoveUnits(finalIds, node.x, node.z, node.id);
@@ -1818,10 +1799,42 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
         pixelScale={pixelScale}
         projectionMode={projectionMode}
         onHoverCoordsChange={setHoverTerrain}
+        onHoverEntityChange={setHoveredEntity}
         onPerfStatsChange={setPerfStats}
         onZoomOutToStrategicMap={handleZoomOutToStrategicMap}
         paused={strategicMap.open}
       />
+
+      {/* Compact Non-Blocking Hover Entity Inspector (Identifies every unit, building & resource on map) */}
+      {!strategicMap.open && hoveredEntity && (
+        <div
+          aria-live="polite"
+          className="pointer-events-none fixed top-[42px] sm:top-[48px] left-2 z-[16] max-w-[235px] px-2.5 py-1.5 bg-[#140e08]/92 border border-[#b68d43]/85 shadow-lg text-[#f3e5c8]"
+        >
+          <div className="flex items-center gap-1.5">
+            {hoveredEntity.accentColor && (
+              <span
+                className="w-2.5 h-2.5 shrink-0 border border-black"
+                style={{ backgroundColor: hoveredEntity.accentColor }}
+              />
+            )}
+            <span className="font-chronicle text-[11px] font-bold text-[#ffebb0] truncate">
+              {hoveredEntity.titleAr}
+            </span>
+          </div>
+          <div className="text-[9.5px] text-[#d6c3a5] truncate mt-0.5">
+            {hoveredEntity.subtitleAr}
+          </div>
+          {typeof hoveredEntity.hpPct === 'number' && (
+            <div className="w-full h-1 bg-[#241609] mt-1 overflow-hidden">
+              <div
+                className={`h-full ${hoveredEntity.hpPct > 45 ? 'bg-[#65a30d]' : 'bg-[#dc2626]'}`}
+                style={{ width: `${Math.max(0, Math.min(100, hoveredEntity.hpPct))}%` }}
+              />
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Full-Viewport Unlimited-Resolution WebGL2 Procedural Strategic Map (Persistently mounted so WebGL2 shader stays warm across scroll-zoom transitions) */}
       <section
@@ -1972,28 +1985,26 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                     معقلي
                   </button>
                 )}
-                {(
-                  [
-                    { label: 'مرقاب', short: 'مرقاب', x: 18200, z: -2800, span: 18_000 },
-                    { label: 'حصن القفول', short: 'حصن القفول', x: 4800, z: 3200, span: 18_000 },
-                    { label: 'الرصافة (البصرة)', short: 'الرصافة', x: 25200, z: 14800, span: 20_000 },
-                    { label: 'القدس', short: 'القدس', x: -26000, z: 13800, span: 20_000 },
-                    { label: 'نصيبين', short: 'نصيبين', x: 1800, z: -27200, span: 20_000 },
-                    { label: 'الوادي الأسود', short: 'الوادي الأسود', x: 24800, z: -9800, span: 18_000 },
-                    { label: 'دمشق', short: 'دمشق', x: -21200, z: -1800, span: 22_000 },
-                    { label: 'حلب', short: 'حلب', x: -17800, z: -24200, span: 22_000 },
-                  ] as const
-                ).map((spot) => (
-                  <button
-                    key={spot.label}
-                    type="button"
-                    onClick={() => flyStrategicMapTo(spot.x, spot.z, spot.span)}
-                    className="h-5 sm:h-6 px-1.5 sm:px-2 rts2k-bevel-btn text-[9.5px] sm:text-[10px] font-semibold text-[#ebd7b4] hover:text-[#ffebb0] cursor-pointer whitespace-nowrap shrink-0"
-                  >
-                    <span className="sm:hidden">{spot.short}</span>
-                    <span className="hidden sm:inline">{spot.label}</span>
-                  </button>
-                ))}
+                {SPAWN_PLATEAUS.map((p, idx) => ({ plateau: p, idx }))
+                  .filter(({ idx }) => {
+                    const bp = getBespokeCityBlueprintByPlateau(idx);
+                    return !bp || worldState?.directorConfig?.enabledCities?.[bp.cityId] !== false;
+                  })
+                  .slice(0, 8)
+                  .map(({ plateau }) => {
+                    const shortName = plateau.continentNameAr.split(' (')[0];
+                    return (
+                      <button
+                        key={plateau.continentNameAr}
+                        type="button"
+                        onClick={() => flyStrategicMapTo(plateau.x, plateau.z, 18_000)}
+                        className="h-5 sm:h-6 px-1.5 sm:px-2 rts2k-bevel-btn text-[9.5px] sm:text-[10px] font-semibold text-[#ebd7b4] hover:text-[#ffebb0] cursor-pointer whitespace-nowrap shrink-0"
+                      >
+                        <span className="sm:hidden">{shortName}</span>
+                        <span className="hidden sm:inline">{plateau.continentNameAr}</span>
+                      </button>
+                    );
+                  })}
               </div>
             </div>
 
@@ -2068,7 +2079,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
           <button
             type="button"
             onClick={centerOnMyKeep}
-            title={`التركيز على معقل ${myPlayer?.name ?? 'مملكة الحصون'} (${activeCultureSpec.shortAr})`}
+            title={`التركيز على معقل ${myPlayer?.name ?? 'مملكة ثار أحمد'} (${activeCultureSpec.shortAr})`}
             className="h-6 sm:h-7 px-1.5 sm:px-2 rts2k-bevel-btn flex items-center gap-1.5 shrink-0 cursor-pointer"
           >
             <HeraldicBannerShieldSvg
@@ -2078,7 +2089,7 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
               className="w-4 h-4 sm:w-5 sm:h-6 shrink-0"
             />
             <span className="font-chronicle text-[11px] sm:text-xs font-bold text-[#ffebb0] truncate max-w-[96px] hidden md:inline">
-              {myPlayer?.name ?? 'مملكة الحصون'}
+              {myPlayer?.name ?? 'مملكة ثار أحمد'}
             </span>
           </button>
 
@@ -2173,20 +2184,16 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
             <span>Lv.{economyStats.urbanReport.tier}</span>
           </button>
 
-          {/* Compact Zoom, Regional Temperature & Climate Line-of-Sight Badge */}
-          <div
-            title={`نطاق الزوم الحالي: ${Math.round(myPlayer?.camera.zoom ?? 38)} م · ${hoverClimateZoneAr} (${hoverTempC}°C · رطوبة ${hoverHumidityPct}%) · الطقس المحلي: ${hoverLocalClimate.nameAr} (${Math.round(getClimateVisionMultiplier(hoverLocalClimateId) * 100)}%)`}
-            className="hidden md:flex h-6 sm:h-7 px-1.5 sm:px-2 rts2k-ink-well text-[#a5f3fc] items-center gap-1 text-[9.5px] font-mono font-bold shrink-0"
+          {/* Nearest Rival / Enemy Jump Button */}
+          <button
+            type="button"
+            onClick={handleJumpNearestEnemy}
+            title="الانتقال الفوري إلى أقرب خصم أو جبهة مشتبكة"
+            className="hidden sm:flex h-6 sm:h-7 px-1.5 rts2k-bevel-btn text-[#fca5a5] items-center gap-1 text-[10px] font-bold shrink-0 cursor-pointer"
           >
-            <Eye className="w-3 h-3 text-[#38bdf8] shrink-0" />
-            <span>{Math.round(myPlayer?.camera.zoom ?? 38)}م</span>
-            <span className="text-[#fde047] text-[8.5px]" dir="ltr">
-              ·{hoverTempC}°C
-            </span>
-            <span className="text-[#7dd3fc] text-[8.5px]">
-              ·{Math.round(getClimateVisionMultiplier(hoverLocalClimateId) * 100)}%
-            </span>
-          </div>
+            <Crosshair className="w-3.5 h-3.5 shrink-0" />
+            <span className="hidden xl:inline whitespace-nowrap">أقرب خصم</span>
+          </button>
 
           <ChiseledSeparatorSvg className="w-1 h-5 hidden md:block shrink-0" />
 
@@ -2301,6 +2308,19 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
               {alivePveFronts.length}
             </span>
             <span className="hidden lg:inline whitespace-nowrap">الجبهات</span>
+          </button>
+
+          {/* World Director & Sultan Hassan Dashboard */}
+          <button
+            type="button"
+            onClick={() => setAdminModalOpen(true)}
+            title="لوحة مخرج العالم: السلطان حسن، المدن، وقواعد القتال"
+            className={`h-6 sm:h-7 px-1.5 sm:px-2 flex items-center gap-1 text-[10px] font-bold shrink-0 cursor-pointer ${
+              adminModalOpen ? 'rts2k-bevel-btn-gold' : 'rts2k-bevel-btn text-[#fde68a]'
+            }`}
+          >
+            <Crown className="w-3.5 h-3.5 text-[#fbbf24] shrink-0" />
+            <span className="hidden xl:inline whitespace-nowrap">المخرج</span>
           </button>
 
           {/* Web Audio SFX Mute Toggle */}
@@ -3128,12 +3148,11 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
             }
             defaultCulture={activeCulture}
             trainingQueue={trainingQueue}
-            onQueueTraining={(items) =>
-              setTrainingQueue((prev) => [...prev, ...items])
-            }
-            onCancelQueueItem={(itemId) =>
-              setTrainingQueue((prev) => prev.filter((it) => it.id !== itemId))
-            }
+            onQueueUnit={(uKind, campId) => {
+              queueUnit(uKind, campId);
+              persistSpawnedUnit(uKind);
+            }}
+            onCancelQueueItem={(itemId) => cancelTraining(itemId)}
             initialSoldierKind={requestedTrainingUnitKind}
             onSelectCamp={(structureId, focusCam) => {
               setRequestedTrainingUnitKind(null);
@@ -3180,12 +3199,14 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                 const goldCost = spec.cost.gold ?? 0;
                 const foodCost = spec.cost.food ?? 0;
                 const clothCost = spec.cost.cloth ?? 0;
+                const horsesCost = spec.cost.horses ?? 0;
                 const canAfford =
                   (myPlayer?.resources.wood ?? 0) >= woodCost &&
                   (myPlayer?.resources.stone ?? 0) >= stoneCost &&
                   (myPlayer?.resources.gold ?? 0) >= goldCost &&
                   (myPlayer?.resources.food ?? 0) >= foodCost &&
-                  (myPlayer?.resources.cloth ?? 0) >= clothCost;
+                  (myPlayer?.resources.cloth ?? 0) >= clothCost &&
+                  (myPlayer?.resources.horses ?? 0) >= horsesCost;
                 const urbanUnlocked =
                   economyStats.urbanReport.tier >= spec.requiredUrbanTier;
 
@@ -3667,14 +3688,31 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                                   className="h-7 px-2.5 rts2k-bevel-btn-gold disabled:opacity-45 text-[10px] font-bold flex items-center gap-1 shrink-0 whitespace-nowrap cursor-pointer"
                                 >
                                   <ArrowUpCircle className="w-3.5 h-3.5 shrink-0" />
-                                  <span>
-                                    {!tierOk
-                                      ? `تطوير Lv.${upgradeReq.nextLevel} (تحضر Lv.${upgradeReq.requiredTier})`
-                                      : `تطوير إلى Lv.${upgradeReq.nextLevel}`}
-                                  </span>
+                                    <span>
+                                      {!tierOk
+                                        ? `تطوير Lv.${upgradeReq.nextLevel} (تحضر Lv.${upgradeReq.requiredTier})`
+                                        : `تطوير إلى Lv.${upgradeReq.nextLevel}`}
+                                    </span>
+                                  </button>
+                                )
+                              )}
+                            {!selectedStructure.isConstructing &&
+                              (selectedStructure.kind !== 'keep' ||
+                                myStructures.filter((s) => s.kind === 'keep').length > 1) && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    demolishStructure(selectedStructure.id);
+                                    setSelectedStructureId(null);
+                                    soundFx.playSelect();
+                                  }}
+                                  title="هدم المبنى واسترجاع 50% من تكلفته"
+                                  className="h-7 px-2 rts2k-bevel-btn-crimson text-[9.5px] font-bold flex items-center gap-1 shrink-0 whitespace-nowrap cursor-pointer"
+                                >
+                                  <Trash2 className="w-3 h-3 shrink-0" />
+                                  <span>هدم +50%</span>
                                 </button>
-                              )
-                            )}
+                              )}
                           </>
                         )}
                       </div>
@@ -3947,12 +3985,14 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                   const goldCost = spec.cost.gold ?? 0;
                   const foodCost = spec.cost.food ?? 0;
                   const clothCost = spec.cost.cloth ?? 0;
+                  const horsesCost = spec.cost.horses ?? 0;
                   const hasWood = (myPlayer?.resources.wood ?? 0) >= woodCost;
                   const hasStone = (myPlayer?.resources.stone ?? 0) >= stoneCost;
                   const hasGold = (myPlayer?.resources.gold ?? 0) >= goldCost;
                   const hasFood = (myPlayer?.resources.food ?? 0) >= foodCost;
                   const hasCloth = (myPlayer?.resources.cloth ?? 0) >= clothCost;
-                  const canAfford = hasWood && hasStone && hasGold && hasFood && hasCloth;
+                  const hasHorses = (myPlayer?.resources.horses ?? 0) >= horsesCost;
+                  const canAfford = hasWood && hasStone && hasGold && hasFood && hasCloth && hasHorses;
                   const urbanUnlocked =
                     economyStats.urbanReport.tier >= spec.requiredUrbanTier;
 
@@ -4066,6 +4106,16 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
                             >
                               <ResourceArtworkSvg kind="cloth" className="w-3.5 h-3.5" />
                               {clothCost}
+                            </span>
+                          )}
+                          {horsesCost > 0 && (
+                            <span
+                              className={`flex items-center gap-0.5 ${
+                                hasHorses ? 'text-[#241609]' : 'text-[#872b24]'
+                              }`}
+                            >
+                              <ResourceArtworkSvg kind="horses" className="w-3.5 h-3.5" />
+                              {horsesCost}
                             </span>
                           )}
                           {goldCost > 0 && (
@@ -4183,7 +4233,67 @@ export const RTSClientInstance: React.FC<RTSClientInstanceProps> = ({
           rttMs={rttMs}
           tickRateHz={tickRateHz}
           onResetWorld={handleResetWorld}
+          onAdaptAllToBiomes={handleAdaptAllStructuresToBiomes}
+          onDiplomacyAction={sendDiplomacyAction}
+          onClaimSultanHassan={() => claimRole('sultan_hassan')}
         />
+      )}
+
+      {/* =====================================================================
+          3B. WORLD DIRECTOR & SULTAN HASSAN ADMIN DASHBOARD MODAL
+         ===================================================================== */}
+      {adminModalOpen && (
+        <AdminDirectorModal onClose={() => setAdminModalOpen(false)} />
+      )}
+
+      {/* =====================================================================
+          3C. VICTORY / DEFEAT MATCH OUTCOME MODAL
+         ===================================================================== */}
+      {matchEvent && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={matchEvent.outcome === 'victory' ? 'نصر حاسم' : 'هزيمة'}
+          className="pointer-events-auto fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+        >
+          <div className="w-full max-w-md rts2k-stone-frame p-4 sm:p-5 text-center space-y-3 text-[#f3e5c8]">
+            <Crown
+              className={`w-10 h-10 mx-auto ${
+                matchEvent.outcome === 'victory' ? 'text-[#fbbf24]' : 'text-[#f87171]'
+              }`}
+            />
+            <h2 className="font-chronicle text-xl font-bold text-[#ffebb0]">
+              {matchEvent.outcome === 'victory' ? 'انتصار مملكتك في ثار أحمد!' : 'سقطت الراية في المعركة'}
+            </h2>
+            {matchEvent.winnerNameAr && (
+              <div className="text-xs font-bold text-[#fde68a]">
+                المنتصر: {matchEvent.winnerNameAr}
+              </div>
+            )}
+            {matchEvent.reasonAr && (
+              <p className="text-xs text-[#d6c3a5] leading-relaxed">{matchEvent.reasonAr}</p>
+            )}
+            <div className="flex items-center justify-center gap-2 pt-2">
+              <button
+                type="button"
+                onClick={clearMatchEvent}
+                className="h-8 px-4 rts2k-bevel-btn-gold text-xs font-bold cursor-pointer"
+              >
+                متابعة المشاهدة
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  clearMatchEvent();
+                  setPveModalOpen(true);
+                }}
+                className="h-8 px-4 rts2k-bevel-btn text-xs font-bold cursor-pointer"
+              >
+                فتح الجبهات
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* =====================================================================

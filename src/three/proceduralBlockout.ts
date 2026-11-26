@@ -27,12 +27,13 @@ import { SHARED_VISION_UNIFORMS } from './visionSystem';
 
 export function applyRetroPixelShader(
   material: THREE.MeshStandardMaterial,
-  options?: { enableVisionFog?: boolean }
+  options?: { enableVisionFog?: boolean; enableOutline?: boolean }
 ): void {
   const enableVisionFog = Boolean(options?.enableVisionFog);
+  const enableOutline = options?.enableOutline !== false;
   material.flatShading = true;
   material.customProgramCacheKey = () =>
-    enableVisionFog ? 'retro_pixel_v2_vision' : 'retro_pixel_v2';
+    `retro_pixel_v3_${enableVisionFog ? 'vis' : 'novis'}_${enableOutline ? 'ol' : 'nool'}`;
   material.onBeforeCompile = (shader) => {
     if (enableVisionFog) {
       shader.uniforms.uVisionTex = SHARED_VISION_UNIFORMS.uVisionTex;
@@ -75,25 +76,12 @@ export function applyRetroPixelShader(
           : ''
       }
       float bayerDither4x4(vec2 pos) {
-        int x = int(mod(pos.x, 4.0));
-        int y = int(mod(pos.y, 4.0));
-        int idx = y * 4 + x;
-        if (idx == 0) return 0.0 / 16.0;
-        if (idx == 1) return 8.0 / 16.0;
-        if (idx == 2) return 2.0 / 16.0;
-        if (idx == 3) return 10.0 / 16.0;
-        if (idx == 4) return 12.0 / 16.0;
-        if (idx == 5) return 4.0 / 16.0;
-        if (idx == 6) return 14.0 / 16.0;
-        if (idx == 7) return 6.0 / 16.0;
-        if (idx == 8) return 3.0 / 16.0;
-        if (idx == 9) return 11.0 / 16.0;
-        if (idx == 10) return 1.0 / 16.0;
-        if (idx == 11) return 9.0 / 16.0;
-        if (idx == 12) return 15.0 / 16.0;
-        if (idx == 13) return 7.0 / 16.0;
-        if (idx == 14) return 13.0 / 16.0;
-        return 5.0 / 16.0;
+        vec2 p4 = floor(mod(pos, 4.0));
+        vec2 c2 = floor(p4 * 0.5);
+        vec2 f2 = mod(p4, 2.0);
+        float fine = mod(f2.x * 2.0 + f2.y * 3.0, 4.0);
+        float coarse = mod(c2.x * 2.0 + c2.y * 3.0, 4.0);
+        return (fine * 4.0 + coarse) / 16.0;
       }
       `
     );
@@ -101,10 +89,16 @@ export function applyRetroPixelShader(
     shader.fragmentShader = shader.fragmentShader.replace(
       '#include <dithering_fragment>',
       `#include <dithering_fragment>
+      ${
+        enableOutline
+          ? `
       vec3 viewDir = normalize(vViewPosition);
       float ndotv = abs(dot(normal, viewDir));
       float spriteOutline = smoothstep(0.10, 0.28, ndotv);
       gl_FragColor.rgb *= mix(0.35, 1.0, spriteOutline);
+      `
+          : ''
+      }
 
       ${
         enableVisionFog
@@ -443,6 +437,29 @@ function createHeraldicFlagTexture(
   return tex;
 }
 
+const MAX_FACTION_CACHE_ENTRIES = 120;
+
+function setBoundedMaterialCache<M extends THREE.Material & { map?: THREE.Texture | null }>(
+  cache: Map<string, M>,
+  key: string,
+  mat: M
+): void {
+  if (cache.has(key)) {
+    cache.delete(key);
+  } else if (cache.size >= MAX_FACTION_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) {
+      const oldest = cache.get(oldestKey);
+      cache.delete(oldestKey);
+      if (oldest) {
+        oldest.map?.dispose();
+        oldest.dispose();
+      }
+    }
+  }
+  cache.set(key, mat);
+}
+
 function getHeraldicFlagMaterial(
   primaryHex: string,
   secondaryHex: string,
@@ -457,6 +474,9 @@ function getHeraldicFlagMaterial(
       alphaTest: 0.45,
       side: THREE.DoubleSide,
     });
+    setBoundedMaterialCache(HERALDIC_FLAG_MAT_CACHE, key, mat);
+  } else {
+    HERALDIC_FLAG_MAT_CACHE.delete(key);
     HERALDIC_FLAG_MAT_CACHE.set(key, mat);
   }
   return mat;
@@ -849,6 +869,9 @@ export function getSharedFactionMaterial(
       flatShading: true,
     });
     applyRetroPixelShader(mat);
+    setBoundedMaterialCache(FACTION_MATERIAL_POOL, key, mat);
+  } else {
+    FACTION_MATERIAL_POOL.delete(key);
     FACTION_MATERIAL_POOL.set(key, mat);
   }
   return mat;
@@ -993,10 +1016,12 @@ const STRUCTURE_TEMPLATE_CACHE = new Map<string, BakedStructureTemplate>();
 function getBakedStructureTemplate(
   kind: StructureKind,
   level: StructureLevel,
-  rawCulture: CultureKind = 'iraqi_mesopotamian'
+  rawCulture: CultureKind = 'iraqi_mesopotamian',
+  variant: 0 | 1 | 2 = 0
 ): BakedStructureTemplate {
   const culture = normalizeCultureKind(rawCulture);
-  const key = `${kind}_L${level}_${culture}`;
+  const effectiveVariant = kind === 'house' ? variant : 0;
+  const key = `${kind}_L${level}_${culture}_v${effectiveVariant}`;
   const cached = STRUCTURE_TEMPLATE_CACHE.get(key);
   if (cached) return cached;
 
@@ -1188,6 +1213,39 @@ function getBakedStructureTemplate(
         goldGeoms.push(xform(new THREE.ConeGeometry(0.14, 0.64, 6), -tentW * 0.32, 0.22 + ridgeH + 0.34, -0.72));
         goldGeoms.push(xform(new THREE.ConeGeometry(0.14, 0.64, 6), tentW * 0.32, 0.22 + ridgeH + 0.34, -0.72));
       }
+    }
+
+    // Apply deterministic architectural silhouette variant so adjacent urban houses vary
+    if (effectiveVariant === 1) {
+      for (const g of plasterGeoms) g.rotateY(Math.PI / 2);
+      for (const g of stoneGeoms) g.rotateY(Math.PI / 2);
+      for (const g of timberGeoms) g.rotateY(Math.PI / 2);
+      for (const g of roofGeoms) g.rotateY(Math.PI / 2);
+      for (const g of secRoofGeoms) g.rotateY(Math.PI / 2);
+      for (const g of factionGeoms) g.rotateY(Math.PI / 2);
+      for (const g of goldGeoms) g.rotateY(Math.PI / 2);
+      for (const g of windowGeoms) g.rotateY(Math.PI / 2);
+      for (const g of archGeoms) g.rotateY(Math.PI / 2);
+      for (const g of foliageGeoms) g.rotateY(Math.PI / 2);
+      for (const g of waterGeoms) g.rotateY(Math.PI / 2);
+      // Signature terraced rooftop pavilion turret
+      plasterGeoms.push(xform(new THREE.BoxGeometry(0.95, 0.9, 0.95), -0.95, 2.75, -0.95));
+      secRoofGeoms.push(createOnionDome(0.55, 0.72, -0.95, 3.2, -0.95, 8));
+    } else if (effectiveVariant === 2) {
+      for (const g of plasterGeoms) g.rotateY(Math.PI);
+      for (const g of stoneGeoms) g.rotateY(Math.PI);
+      for (const g of timberGeoms) g.rotateY(Math.PI);
+      for (const g of roofGeoms) g.rotateY(Math.PI);
+      for (const g of secRoofGeoms) g.rotateY(Math.PI);
+      for (const g of factionGeoms) g.rotateY(Math.PI);
+      for (const g of goldGeoms) g.rotateY(Math.PI);
+      for (const g of windowGeoms) g.rotateY(Math.PI);
+      for (const g of archGeoms) g.rotateY(Math.PI);
+      for (const g of foliageGeoms) g.rotateY(Math.PI);
+      for (const g of waterGeoms) g.rotateY(Math.PI);
+      // Twin-arched shaded pergola annex & cypress accent
+      timberGeoms.push(xform(new THREE.BoxGeometry(1.45, 0.14, 0.95), 0.85, 2.35, 0.85));
+      foliageGeoms.push(xform(new THREE.ConeGeometry(0.32, 1.55, 6), 1.48, 1.15, 1.48));
     }
   }
 
@@ -2582,7 +2640,8 @@ export function buildOrUpdateStructureLOD(
   rawCulture: CultureKind = 'iraqi_mesopotamian',
   existingLod?: THREE.LOD,
   secondaryColor = '#fbbf24',
-  bannerPattern: BannerPatternKind = 'crescent_star'
+  bannerPattern: BannerPatternKind = 'crescent_star',
+  variant: 0 | 1 | 2 = 0
 ): THREE.LOD {
   const culture = normalizeCultureKind(rawCulture);
   const lod = existingLod ?? new THREE.LOD();
@@ -2591,7 +2650,7 @@ export function buildOrUpdateStructureLOD(
   }
   lod.levels.length = 0;
 
-  const template = getBakedStructureTemplate(kind, level, culture);
+  const template = getBakedStructureTemplate(kind, level, culture, variant);
   const factionMat = getSharedFactionMaterial(factionColor, secondaryColor);
   const cultureMats = getCultureMaterials(culture);
 
@@ -2654,6 +2713,7 @@ export function buildOrUpdateStructureLOD(
     secondaryColor,
     bannerPattern,
     culture,
+    variant,
   };
   return lod;
 }

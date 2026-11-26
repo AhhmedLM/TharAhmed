@@ -10,6 +10,8 @@
       "DOM",
       "DOM.Iterable"
     ],
+    "strict": true,
+    "noUnusedLocals": true,
     "skipLibCheck": true,
     "moduleResolution": "bundler",
     "isolatedModules": true,
@@ -24,5 +26,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "exclude": ["dist", "firestore.rules.test.ts"]
+  "exclude": ["dist", "node_modules"]
 }

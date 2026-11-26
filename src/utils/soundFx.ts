@@ -1,19 +1,29 @@
 // Pure Web Audio API 2000s RTS Synthesized Sound Effects Engine (Zero external assets)
 
-const MUTE_STORAGE_KEY = 'husun_rts_sfx_muted_v1';
+const MUTE_STORAGE_KEY = 'thar_ahmed_sfx_muted_v1';
+const VOLUME_STORAGE_KEY = 'thar_ahmed_sfx_volume_v1';
 
 class SoundFxEngine {
   private ctx: AudioContext | null = null;
+  private masterGain: GainNode | null = null;
   private muted: boolean = false;
+  private masterVolume: number = 0.75;
   private lastPlayedAt = new Map<string, number>();
 
   constructor() {
     try {
       if (typeof window !== 'undefined') {
-        this.muted = window.localStorage.getItem(MUTE_STORAGE_KEY) === '1';
+        this.muted =
+          window.localStorage.getItem(MUTE_STORAGE_KEY) === '1' ||
+          window.localStorage.getItem('husun_rts_sfx_muted_v1') === '1';
+        const savedVol = Number(window.localStorage.getItem(VOLUME_STORAGE_KEY));
+        if (Number.isFinite(savedVol) && savedVol >= 0 && savedVol <= 1) {
+          this.masterVolume = savedVol;
+        }
       }
     } catch {
       this.muted = false;
+      this.masterVolume = 0.75;
     }
   }
 
@@ -32,7 +42,26 @@ class SoundFxEngine {
     }
   }
 
-  private getCtx(): AudioContext | null {
+  public getVolume(): number {
+    return this.masterVolume;
+  }
+
+  public setVolume(next: number): void {
+    const clamped = Math.max(0, Math.min(1, Number.isFinite(next) ? next : 0.75));
+    this.masterVolume = clamped;
+    if (this.masterGain && this.ctx) {
+      this.masterGain.gain.setTargetAtTime(clamped, this.ctx.currentTime, 0.02);
+    }
+    try {
+      if (typeof window !== 'undefined') {
+        window.localStorage.setItem(VOLUME_STORAGE_KEY, String(clamped));
+      }
+    } catch {
+      // Ignore storage failures
+    }
+  }
+
+  private getCtx(): { ctx: AudioContext; out: AudioNode } | null {
     if (this.muted || typeof window === 'undefined') return null;
     if (!this.ctx) {
       const Ctor =
@@ -40,11 +69,19 @@ class SoundFxEngine {
         (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       if (!Ctor) return null;
       this.ctx = new Ctor();
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = this.masterVolume;
+      this.masterGain.connect(this.ctx.destination);
     }
     if (this.ctx.state === 'suspended') {
       void this.ctx.resume().catch(() => {});
     }
-    return this.ctx;
+    if (!this.masterGain) {
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = this.masterVolume;
+      this.masterGain.connect(this.ctx.destination);
+    }
+    return { ctx: this.ctx, out: this.masterGain };
   }
 
   private canPlay(key: string, cooldownMs: number): boolean {
@@ -63,8 +100,9 @@ class SoundFxEngine {
     volume: number,
     delaySec = 0
   ) {
-    const ctx = this.getCtx();
-    if (!ctx) return;
+    const audio = this.getCtx();
+    if (!audio) return;
+    const { ctx, out } = audio;
     const t0 = ctx.currentTime + delaySec;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
@@ -77,14 +115,15 @@ class SoundFxEngine {
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + durationSec);
 
     osc.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(out);
     osc.start(t0);
     osc.stop(t0 + durationSec + 0.02);
   }
 
   private playNoiseBurst(durationSec: number, filterHz: number, volume: number, q = 1.5) {
-    const ctx = this.getCtx();
-    if (!ctx) return;
+    const audio = this.getCtx();
+    if (!audio) return;
+    const { ctx, out } = audio;
     const sampleCount = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
     const buffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
     const data = buffer.getChannelData(0);
@@ -106,7 +145,7 @@ class SoundFxEngine {
 
     src.connect(filter);
     filter.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(out);
     src.start();
   }
 

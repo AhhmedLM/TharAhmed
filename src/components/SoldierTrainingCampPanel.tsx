@@ -19,6 +19,7 @@ import {
   PlayerResources,
   STRUCTURE_SPECS,
   StructureKind,
+  TrainingQueueItem,
   UNIT_SPECS,
   UnitKind,
   UnitSkillIconKind,
@@ -29,14 +30,6 @@ import {
   BrassCornerMountSvg,
   ResourceArtworkSvg,
 } from './Retro2000sIcons';
-
-export interface QueuedTrainingItem {
-  id: string;
-  unitKind: UnitKind;
-  campId: string;
-  durationSec: number;
-  elapsedSec: number;
-}
 
 export interface SoldierTrainingCampPanelProps {
   selectedCamp: BlockoutStructure;
@@ -51,8 +44,8 @@ export interface SoldierTrainingCampPanelProps {
   secondaryColor: string;
   bannerPattern: BannerPatternKind;
   defaultCulture: CultureKind;
-  trainingQueue: QueuedTrainingItem[];
-  onQueueTraining: (items: QueuedTrainingItem[]) => void;
+  trainingQueue: TrainingQueueItem[];
+  onQueueUnit: (unitKind: UnitKind, campId: string) => void;
   onCancelQueueItem: (itemId: string) => void;
   initialSoldierKind?: UnitKind | null;
   onSelectCamp: (structureId: string, focusCamera?: boolean) => void;
@@ -426,7 +419,7 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
   bannerPattern,
   defaultCulture,
   trainingQueue,
-  onQueueTraining,
+  onQueueUnit,
   onCancelQueueItem,
   initialSoldierKind,
   onSelectCamp,
@@ -490,38 +483,7 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
     return maxLvl;
   }, [allMyStructures]);
 
-  const reservedResources = useMemo(() => {
-    const totals: PlayerResources = {
-      wood: 0,
-      stone: 0,
-      gold: 0,
-      food: 0,
-      cloth: 0,
-      horses: 0,
-    };
-    for (const item of trainingQueue) {
-      const uCost = UNIT_SPECS[item.unitKind].cost;
-      totals.wood += uCost.wood ?? 0;
-      totals.stone += uCost.stone ?? 0;
-      totals.gold += uCost.gold ?? 0;
-      totals.food += uCost.food ?? 0;
-      totals.cloth += uCost.cloth ?? 0;
-      totals.horses += uCost.horses ?? 0;
-    }
-    return totals;
-  }, [trainingQueue]);
-
-  const availableResources: PlayerResources = useMemo(
-    () => ({
-      wood: Math.max(0, resources.wood - reservedResources.wood),
-      stone: Math.max(0, resources.stone - reservedResources.stone),
-      gold: Math.max(0, resources.gold - reservedResources.gold),
-      food: Math.max(0, resources.food - reservedResources.food),
-      cloth: Math.max(0, resources.cloth - reservedResources.cloth),
-      horses: Math.max(0, resources.horses - reservedResources.horses),
-    }),
-    [resources, reservedResources]
-  );
+  const availableResources = resources;
 
   const activeSoldierSpec = UNIT_SPECS[selectedSoldierKind];
   const campSpec = STRUCTURE_SPECS[selectedCamp.kind];
@@ -534,13 +496,6 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
   const effectiveSpeed =
     Math.round(activeSoldierSpec.speed * (1 + cavalrySpeedBonusPct / 100) * 10) / 10;
   const effectiveHp = Math.round(activeSoldierSpec.maxHp * unitHpMultiplier);
-
-  const { seconds: effectiveTrainSeconds } =
-    getUnitTrainingDurationSeconds(
-      selectedSoldierKind,
-      selectedCamp.kind,
-      selectedCamp.level
-    );
 
   const foodCost = activeSoldierSpec.cost.food ?? 0;
   const woodCost = activeSoldierSpec.cost.wood ?? 0;
@@ -565,21 +520,30 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
   const canStartTraining =
     canAffordOne && urbanUnlocked && popAvailable && campReady;
 
-  const handleStartTrainingProcess = () => {
-    if (!canStartTraining) return;
+  const handleStartTrainingProcess = (overrideKind?: UnitKind) => {
+    const targetKind = overrideKind ?? selectedSoldierKind;
+    const tSpec = UNIT_SPECS[targetKind];
+    if (!campReady || urbanTier < tSpec.requiredUrbanTier) return;
+    const fC = tSpec.cost.food ?? 0;
+    const wC = tSpec.cost.wood ?? 0;
+    const sC = tSpec.cost.stone ?? 0;
+    const gC = tSpec.cost.gold ?? 0;
+    const cC = tSpec.cost.cloth ?? 0;
+    const hC = tSpec.cost.horses ?? 0;
 
     const remainingPopSlots = Math.max(
       0,
       maxPopulation - (myUnits.length + trainingQueue.length)
     );
-    const maxByFood = foodCost > 0 ? Math.floor(availableResources.food / foodCost) : 99;
-    const maxByWood = woodCost > 0 ? Math.floor(availableResources.wood / woodCost) : 99;
-    const maxByStone = stoneCost > 0 ? Math.floor(availableResources.stone / stoneCost) : 99;
-    const maxByGold = goldCost > 0 ? Math.floor(availableResources.gold / goldCost) : 99;
-    const maxByCloth = clothCost > 0 ? Math.floor(availableResources.cloth / clothCost) : 99;
-    const maxByHorses = horsesCost > 0 ? Math.floor(availableResources.horses / horsesCost) : 99;
+    const maxByFood = fC > 0 ? Math.floor(availableResources.food / fC) : 99;
+    const maxByWood = wC > 0 ? Math.floor(availableResources.wood / wC) : 99;
+    const maxByStone = sC > 0 ? Math.floor(availableResources.stone / sC) : 99;
+    const maxByGold = gC > 0 ? Math.floor(availableResources.gold / gC) : 99;
+    const maxByCloth = cC > 0 ? Math.floor(availableResources.cloth / cC) : 99;
+    const maxByHorses = hC > 0 ? Math.floor(availableResources.horses / hC) : 99;
 
     const affordableCount = Math.min(
+      Math.max(0, 10 - trainingQueue.length),
       batchCount,
       remainingPopSlots,
       maxByFood,
@@ -591,28 +555,26 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
     );
 
     if (affordableCount <= 0) return;
-
-    const newItems: QueuedTrainingItem[] = Array.from(
-      { length: affordableCount },
-      (_, idx) => ({
-        id: `trn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${idx}`,
-        unitKind: selectedSoldierKind,
-        campId: selectedCamp.id,
-        durationSec: effectiveTrainSeconds,
-        elapsedSec: 0,
-      })
-    );
-
-    onQueueTraining(newItems);
+    for (let i = 0; i < affordableCount; i++) {
+      onQueueUnit(targetKind, selectedCamp.id);
+    }
   };
 
   const activeHeadItem = trainingQueue[0] ?? null;
-  const activeHeadProgressPct = activeHeadItem
-    ? Math.min(
-        100,
-        Math.round((activeHeadItem.elapsedSec / activeHeadItem.durationSec) * 100)
-      )
-    : 0;
+  const activeHeadProgressPct =
+    activeHeadItem && activeHeadItem.durationSec > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              ((activeHeadItem.durationSec - activeHeadItem.remainingSec) /
+                activeHeadItem.durationSec) *
+                100
+            )
+          )
+        )
+      : 0;
 
   const upgradeReq = !selectedCamp.isConstructing
     ? getStructureUpgradeRequirement(selectedCamp.kind, selectedCamp.level)
@@ -716,6 +678,11 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
             const queuedCount = trainingQueue.filter((q) => q.unitKind === uKind).length;
             const unlocked = urbanTier >= uSpec.requiredUrbanTier;
             const isPreferredHere = uSpec.preferredCamps.includes(selectedCamp.kind);
+            const cardTrainSeconds = getUnitTrainingDurationSeconds(
+              uKind,
+              selectedCamp.kind,
+              selectedCamp.level
+            ).seconds;
 
             return (
               <button
@@ -724,7 +691,7 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
                 onClick={() => setSelectedSoldierKind(uKind)}
                 onDoubleClick={() => {
                   setSelectedSoldierKind(uKind);
-                  handleStartTrainingProcess();
+                  handleStartTrainingProcess(uKind);
                 }}
                 title={`${uSpec.labelAr} — نقرة لعرض المهارات، دبل كليك لبدء التدريب`}
                 className={`rts2k-hud-soldier-tile relative w-[62px] h-[64px] sm:w-[76px] sm:h-[94px] p-1 flex flex-col items-center justify-between shrink-0 cursor-pointer ${
@@ -779,7 +746,7 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
                       isSelected ? 'text-[#3b2208]' : 'text-[#c8b28e]'
                     }`}
                   >
-                    {unlocked ? `${effectiveTrainSeconds}ث` : `Lv.${uSpec.requiredUrbanTier}`}
+                    {unlocked ? `${cardTrainSeconds}ث` : `Lv.${uSpec.requiredUrbanTier}`}
                   </div>
                 </div>
               </button>
@@ -979,7 +946,7 @@ export const SoldierTrainingCampPanel: React.FC<SoldierTrainingCampPanelProps> =
           <button
             type="button"
             disabled={!canStartTraining}
-            onClick={handleStartTrainingProcess}
+            onClick={() => handleStartTrainingProcess()}
             className="flex-1 h-7 px-2 rts2k-bevel-btn-gold disabled:opacity-45 font-bold text-[10px] sm:text-[11px] flex items-center justify-center gap-1 cursor-pointer whitespace-nowrap"
           >
             <Swords className="w-3.5 h-3.5 shrink-0" />

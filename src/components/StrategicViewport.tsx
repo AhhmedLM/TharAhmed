@@ -3,7 +3,6 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   CameraTransform,
-  CitizenRoleKind,
   CombatEvent,
   CultureKind,
   evaluateEnvironmentalFit,
@@ -15,8 +14,18 @@ import {
   STRUCTURE_SPECS,
   StructureKind,
   StructureLevel,
+  UNIT_SPECS,
   WorldState,
 } from '../shared/protocol';
+
+const RESOURCE_LABELS_AR: Record<string, string> = {
+  wood: 'أخشاب',
+  stone: 'حجارة',
+  gold: 'ذهب',
+  food: 'غذاء',
+  cloth: 'قماش وقطن',
+  horses: 'خيول أصيلة',
+};
 import {
   BiomeKind,
   CHUNK_SIZE,
@@ -26,12 +35,11 @@ import {
   evaluateFortificationTerrain,
   formatBearingAr,
   formatDistanceAr,
-  formatWorldCoordKm,
   getBiomeAt,
   getEffectiveClimateAt,
   getTerrainHeight,
-  isBuildableTerrain,
   MACRO_LANDMARKS,
+  SPAWN_PLATEAUS,
   WORLD_HALF_SIZE,
 } from '../shared/worldMap';
 import {
@@ -45,7 +53,6 @@ import {
 } from '../shared/fortificationHelpers';
 import { BuildPlacementGridOverlay } from '../three/buildGridOverlay';
 import {
-  build2DPixelCitizenSprite,
   build2DPixelResourceSprite,
   build2DPixelUnitSprite,
   getBanditSpriteMaterials,
@@ -81,7 +88,6 @@ const _camRight = new THREE.Vector3();
 const _camUp = new THREE.Vector3();
 const _camForward = new THREE.Vector3();
 const _focusVec = new THREE.Vector3();
-const _projVec = new THREE.Vector3();
 
 const COMPASS_CARDINALS: ReadonlyArray<{ label: string; deg: number; major: boolean }> = [
   { label: 'ش', deg: 0, major: true },
@@ -94,17 +100,7 @@ const COMPASS_CARDINALS: ReadonlyArray<{ label: string; deg: number; major: bool
   { label: 'ش.غ', deg: 315, major: false },
 ];
 
-const HORIZON_SIGNPOST_POOL_SIZE = 2;
 const COMPASS_LANDMARK_PIPS = 3;
-const landmarkElevationCache = new Map<string, number>();
-function getCachedLandmarkElevation(key: string, x: number, z: number): number {
-  let elev = landmarkElevationCache.get(key);
-  if (elev === undefined) {
-    elev = Math.max(0, getTerrainHeight(x, z));
-    landmarkElevationCache.set(key, elev);
-  }
-  return elev;
-}
 
 export function getWorldPixelsPerMeter(
   scale: PixelScaleMode,
@@ -134,6 +130,15 @@ export interface HoverTerrainInfo {
   z: number;
   elevation: number;
   biome: BiomeKind;
+}
+
+export interface HoveredEntityInfo {
+  entityKind: 'unit' | 'structure' | 'resource';
+  id: string;
+  titleAr: string;
+  subtitleAr: string;
+  hpPct?: number;
+  accentColor?: string;
 }
 
 export interface CameraPresetCommand {
@@ -218,6 +223,7 @@ interface StrategicViewportProps {
   pixelScale?: PixelScaleMode;
   projectionMode?: CameraProjectionMode;
   onHoverCoordsChange?: (info: HoverTerrainInfo) => void;
+  onHoverEntityChange?: (info: HoveredEntityInfo | null) => void;
   onPerfStatsChange?: (stats: RenderPerfStats) => void;
   onZoomOutToStrategicMap?: (worldX: number, worldZ: number, currentZoom: number) => void;
   paused?: boolean;
@@ -259,11 +265,13 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
   pixelScale = 3,
   projectionMode = 'isometric_2000s',
   onHoverCoordsChange,
+  onHoverEntityChange,
   onPerfStatsChange,
   onZoomOutToStrategicMap,
   paused = false,
 }) => {
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
+  const [webglContextLost, setWebglContextLost] = useState(false);
   const [selectionBoxRect, setSelectionBoxRect] = useState<{
     left: number;
     top: number;
@@ -349,8 +357,6 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
   const compassCardRefs = useRef<Array<HTMLSpanElement | null>>([]);
   const compassKeepPipRef = useRef<HTMLSpanElement | null>(null);
   const compassLmPipRefs = useRef<Array<HTMLSpanElement | null>>([]);
-  const horizonPinElRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  const horizonPinTargetsRef = useRef<Array<{ x: number; z: number }>>([]);
   const keepTargetPosRef = useRef<{ x: number; z: number } | null>(null);
 
   useEffect(() => {
@@ -378,6 +384,7 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
     onUnderAttackAlert,
     onSyncCamera,
     onHoverCoordsChange,
+    onHoverEntityChange,
     onPerfStatsChange,
     onZoomOutToStrategicMap,
   });
@@ -398,6 +405,7 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
     onUnderAttackAlert,
     onSyncCamera,
     onHoverCoordsChange,
+    onHoverEntityChange,
     onPerfStatsChange,
     onZoomOutToStrategicMap,
   };
@@ -607,46 +615,14 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
       ReturnType<typeof buildRemotePlayerPresence>
     >();
 
-    // Living Ambient Citizens & Hearth Chimney Smoke Registries
-    interface AmbientCitizenAgent {
-      id: string;
-      homeStructureId: string;
-      ownerId: string;
-      ownerColor: string;
-      role: CitizenRoleKind;
-      group: THREE.Group;
-      x: number;
-      z: number;
-      lastGroundX: number;
-      lastGroundZ: number;
-      lastGroundY: number;
-      targetX: number;
-      targetZ: number;
-      rotationY: number;
-      speed: number;
-      waitTimer: number;
-      goingHome: boolean;
-      phaseOffset: number;
-    }
-    const ambientCitizens = new Map<string, AmbientCitizenAgent>();
-    const hearthSmokeMeshes = new Map<
-      string,
-      { puffs: THREE.Mesh[]; baseX: number; baseY: number; baseZ: number }
-    >();
-    const smokePuffGeom = new THREE.BoxGeometry(0.45, 0.45, 0.45);
-    const smokePuffMat = new THREE.MeshBasicMaterial({
-      color: 0xe2e8f0,
-      transparent: true,
-      opacity: 0.42,
-    });
+    const UNIT_SELECTION_RING_GEOM = new THREE.RingGeometry(0.85, 1.1, 8);
+    UNIT_SELECTION_RING_GEOM.rotateX(-Math.PI / 2);
 
     // Selected structure isometric diamond highlight ring
     const structSelectRingGeom = new THREE.RingGeometry(3.4, 3.9, 8);
     structSelectRingGeom.rotateX(-Math.PI / 2);
-    const structSelectRing = new THREE.Mesh(
-      structSelectRingGeom,
-      new THREE.MeshBasicMaterial({ color: 0xfbbf24, side: THREE.DoubleSide })
-    );
+    const structSelectRingMat = new THREE.MeshBasicMaterial({ color: 0xfbbf24, side: THREE.DoubleSide });
+    const structSelectRing = new THREE.Mesh(structSelectRingGeom, structSelectRingMat);
     structSelectRing.position.y = 0.15;
     structSelectRing.visible = false;
     scene.add(structSelectRing);
@@ -1553,6 +1529,83 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
           } else {
             lastHoverEmitMs = nowMs;
           }
+
+          if (callbacksRef.current.onHoverEntityChange) {
+            const curWorld = worldRef.current;
+            let hovered: HoveredEntityInfo | null = null;
+            if (curWorld && !buildModeRef.current) {
+              const curPid = playerIdRef.current;
+              let bestDist = 4.2;
+
+              // 1. Check nearby visible units
+              for (const uId in curWorld.units) {
+                const u = curWorld.units[uId];
+                const isOwn = u.ownerId === curPid;
+                if (!isOwn && (u.isBanditUnit && u.isStealthed)) continue;
+                if (!isOwn && !visionSystem.isWorldPointVisible(u.x, u.z, 0.22)) continue;
+                const d = Math.hypot(u.x - hit.x, u.z - hit.z);
+                if (d < Math.min(2.6, bestDist)) {
+                  bestDist = d;
+                  const ownerName = curWorld.players?.[u.ownerId]?.name ?? 'قوة مجهولة';
+                  const uSpec = UNIT_SPECS[u.kind];
+                  hovered = {
+                    entityKind: 'unit',
+                    id: u.id,
+                    titleAr: u.isHeroSultan ? `السلطان حسن (${uSpec?.shortAr ?? u.kind})` : (uSpec?.shortAr ?? u.kind),
+                    subtitleAr: `${ownerName} · صحة ${Math.round(u.hp)}/${u.maxHp}`,
+                    hpPct: u.maxHp > 0 ? Math.max(0, Math.min(100, Math.round((u.hp / u.maxHp) * 100))) : 100,
+                    accentColor: u.ownerColor,
+                  };
+                }
+              }
+
+              // 2. Check nearby visible structures
+              if (!hovered) {
+                bestDist = 5.4;
+                for (const sId in curWorld.structures) {
+                  const st = curWorld.structures[sId];
+                  const ownerPlr = curWorld.players?.[st.ownerId];
+                  const isOwnOrCity = st.ownerId === curPid || Boolean(ownerPlr && !ownerPlr.isBandit);
+                  if (!isOwnOrCity && !visionSystem.isWorldPointVisible(st.x, st.z, 0.22)) continue;
+                  const d = Math.hypot(st.x - hit.x, st.z - hit.z);
+                  const rad = st.kind === 'keep' ? 5.2 : 3.6;
+                  if (d < rad && d < bestDist) {
+                    bestDist = d;
+                    const sSpec = STRUCTURE_SPECS[st.kind];
+                    const ownerName = ownerPlr?.name ?? 'بناء مستقل';
+                    hovered = {
+                      entityKind: 'structure',
+                      id: st.id,
+                      titleAr: `${sSpec?.labelAr?.split(' (')[0] ?? st.kind} (م${st.level ?? 1})`,
+                      subtitleAr: `${ownerName} · متانة ${Math.round(st.hp)}/${st.maxHp}`,
+                      hpPct: st.maxHp > 0 ? Math.max(0, Math.min(100, Math.round((st.hp / st.maxHp) * 100))) : 100,
+                      accentColor: st.ownerColor,
+                    };
+                  }
+                }
+              }
+
+              // 3. Check nearby resource nodes
+              if (!hovered) {
+                bestDist = 3.2;
+                for (const rId in curWorld.resourceNodes) {
+                  const rn = curWorld.resourceNodes[rId];
+                  const d = Math.hypot(rn.x - hit.x, rn.z - hit.z);
+                  if (d < bestDist) {
+                    bestDist = d;
+                    hovered = {
+                      entityKind: 'resource',
+                      id: rn.id,
+                      titleAr: RESOURCE_LABELS_AR[rn.kind] ?? rn.kind,
+                      subtitleAr: `متبقي ${Math.round(rn.amount)} / ${rn.maxAmount}`,
+                      hpPct: rn.maxAmount > 0 ? Math.round((rn.amount / rn.maxAmount) * 100) : 100,
+                    };
+                  }
+                }
+              }
+            }
+            callbacksRef.current.onHoverEntityChange(hovered);
+          }
         }
       }
     };
@@ -1738,6 +1791,13 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
     };
 
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
+    const onWebglContextLost = (e: Event) => {
+      e.preventDefault();
+      setWebglContextLost(true);
+    };
+    const onWebglContextRestored = () => {
+      setWebglContextLost(false);
+    };
 
     const domElem = renderer.domElement;
     window.addEventListener('keydown', handleKeyDown);
@@ -1748,6 +1808,8 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
     domElem.addEventListener('pointercancel', onPointerUp);
     domElem.addEventListener('wheel', onWheel, { passive: false });
     domElem.addEventListener('contextmenu', onContextMenu);
+    domElem.addEventListener('webglcontextlost', onWebglContextLost);
+    domElem.addEventListener('webglcontextrestored', onWebglContextRestored);
 
     const handleResize = () => {
       refreshMountMetrics();
@@ -1769,16 +1831,9 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
     let frameCounter = 0;
     let lastPerfReportTime = performance.now();
 
-    // Pre-allocated tick scratch collections & caches (Zero per-frame GC churn)
+      // Pre-allocated tick scratch collections & caches (Zero per-frame GC churn)
     const selectedSet = new Set<string>();
-    const expectedCitizenIds = new Set<string>();
-    const expectedSmokeIds = new Set<string>();
-    const rolesOrder: CitizenRoleKind[] = [
-      'farmer',
-      'merchant',
-      'water_carrier',
-      'scholar',
-    ];
+    const activeCityPlateauSet = new Set<number>();
     let lastFocusCamX = Number.NaN;
     let lastFocusCamZ = Number.NaN;
     let cachedFocusElevation = 2.0;
@@ -1904,6 +1959,22 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
         originZ = Math.round(rig.currentZ / CHUNK_SIZE) * CHUNK_SIZE;
       }
 
+      activeCityPlateauSet.clear();
+      if (world?.structures) {
+        const structs = world.structures;
+        for (const stId in structs) {
+          const st = structs[stId];
+          for (let pi = 0; pi < SPAWN_PLATEAUS.length; pi++) {
+            if (activeCityPlateauSet.has(pi)) continue;
+            const p = SPAWN_PLATEAUS[pi];
+            if (Math.hypot(st.x - p.x, st.z - p.z) <= 85) {
+              activeCityPlateauSet.add(pi);
+              break;
+            }
+          }
+        }
+      }
+
       terrainBundle.weatherSystem.update(
         delta,
         activeClimateId,
@@ -1913,7 +1984,8 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
         originZ,
         rig.currentYaw,
         rig.currentZoom,
-        isPersp3D
+        isPersp3D,
+        activeCityPlateauSet
       );
 
       if (world) {
@@ -1928,7 +2000,6 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
           activeClimateId
         );
       }
-      visionSystem.bindToShaders(originX, originZ);
 
       // Keyboard WASD / Arrow strategic camera panning
       const panSpeed = rig.currentZoom * 0.85 * delta;
@@ -2443,6 +2514,9 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
             st.secondaryColor ?? ownerPlr?.secondaryColor ?? '#fbbf24';
           const stBanner =
             st.bannerPattern ?? ownerPlr?.bannerPattern ?? 'crescent_star';
+          const stVariant = (st.kind === 'house'
+            ? (Math.abs(Math.round(st.x * 7 + st.z * 13)) % 3)
+            : 0) as 0 | 1 | 2;
           let sy: number;
           if (!sLod) {
             sy = getTerrainHeight(st.x, st.z);
@@ -2453,7 +2527,8 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
               stCulture,
               undefined,
               stSecondary,
-              stBanner
+              stBanner,
+              stVariant
             );
             sLod.userData.groundY = sy;
             sLod.position.set(st.x - originX, sy, st.z - originZ);
@@ -2472,7 +2547,8 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
               sLod.userData.culture !== stCulture ||
               sLod.userData.factionColor !== stPrimary ||
               sLod.userData.secondaryColor !== stSecondary ||
-              sLod.userData.bannerPattern !== stBanner
+              sLod.userData.bannerPattern !== stBanner ||
+              sLod.userData.variant !== stVariant
             ) {
               buildOrUpdateStructureLOD(
                 st.kind,
@@ -2481,7 +2557,8 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
                 stCulture,
                 sLod,
                 stSecondary,
-                stBanner
+                stBanner,
+                stVariant
               );
             }
           }
@@ -2629,6 +2706,13 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
           if (!unitMap[id]) {
             scene.remove(entry.group);
             scene.remove(entry.targetLine);
+            (entry.selectionRing.material as THREE.Material).dispose();
+            const hpBar = entry.group.userData?.hpBar as
+              | { fillMat?: THREE.Material }
+              | undefined;
+            hpBar?.fillMat?.dispose();
+            entry.targetLine.geometry.dispose();
+            (entry.targetLine.material as THREE.Material).dispose();
             unitMeshes.delete(id);
           }
         }
@@ -2679,10 +2763,8 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
             const uy = getTerrainHeight(u.x, u.z);
             group.position.set(u.x - originX, uy, u.z - originZ);
 
-            const ringGeom = new THREE.RingGeometry(0.85, 1.1, 8);
-            ringGeom.rotateX(-Math.PI / 2);
             const selectionRing = new THREE.Mesh(
-              ringGeom,
+              UNIT_SELECTION_RING_GEOM,
               new THREE.MeshBasicMaterial({
                 color: 0x38bdf8,
                 side: THREE.DoubleSide,
@@ -2875,7 +2957,10 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
             const ev = combatEvs[i];
             if (seenCombatEventIds.has(ev.id)) continue;
             seenCombatEventIds.add(ev.id);
-            if (seenCombatEventIds.size > 400) seenCombatEventIds.clear();
+            if (seenCombatEventIds.size > 400) {
+              const oldest = seenCombatEventIds.values().next().value;
+              if (oldest !== undefined) seenCombatEventIds.delete(oldest);
+            }
 
             if (ev.kind === 'alert' && ev.targetOwnerId === pid) {
               callbacksRef.current.onUnderAttackAlert?.(ev.toX, ev.toZ, ev.labelAr, 'danger');
@@ -3000,285 +3085,6 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
           }
         }
 
-        // 3B. Living Ambient Citizens + Warm Hearth Chimney Smoke (throttled spawns & zero allocation)
-        expectedCitizenIds.clear();
-        expectedSmokeIds.clear();
-        const showCitizens = rig.currentZoom <= 115;
-        let spawnedCitizensThisFrame = 0;
-        let spawnedSmokeThisFrame = 0;
-
-        if (showCitizens) {
-          for (const stId in strMap) {
-            const st = strMap[stId];
-            if (st.isConstructing) continue;
-            if (Math.hypot(st.x - rig.currentX, st.z - rig.currentZ) > 420) continue;
-            if (
-              st.kind === 'house' ||
-              st.kind === 'farm' ||
-              st.kind === 'livestock_ranch' ||
-              st.kind === 'horse_stable' ||
-              st.kind === 'bedouin_tent'
-            ) {
-              const count =
-                st.kind === 'house' ||
-                st.kind === 'livestock_ranch' ||
-                st.kind === 'horse_stable'
-                  ? Math.min(4, (st.level ?? 1) + 2)
-                  : Math.min(3, (st.level ?? 1) + 1);
-              for (let i = 0; i < count; i++) {
-                const cid = `cit_${st.id}_${i}`;
-                expectedCitizenIds.add(cid);
-                if (!ambientCitizens.has(cid) && spawnedCitizensThisFrame < 4) {
-                  spawnedCitizensThisFrame += 1;
-                  let role: CitizenRoleKind;
-                  if (st.kind === 'horse_stable') {
-                    role =
-                      i === 0
-                        ? 'horse_trainer'
-                        : i % 2 === 1
-                          ? 'tamed_stallion'
-                          : 'wild_horse';
-                  } else if (st.kind === 'livestock_ranch') {
-                    role =
-                      i === 0
-                        ? 'shepherd'
-                        : i % 2 === 1
-                          ? 'livestock_sheep'
-                          : 'livestock_camel';
-                  } else if (st.kind === 'bedouin_tent') {
-                    role =
-                      i === 0
-                        ? 'shepherd'
-                        : i === 1
-                          ? 'livestock_camel'
-                          : 'tamed_stallion';
-                  } else if (st.kind === 'farm') {
-                    role = i % 2 === 0 ? 'farmer' : 'water_carrier';
-                  } else {
-                    role = rolesOrder[i % rolesOrder.length];
-                  }
-                  const group = build2DPixelCitizenSprite(role, st.ownerColor);
-                  const angle = (i / count) * Math.PI * 2;
-                  const startX = st.x + Math.cos(angle) * 2.4;
-                  const startZ = st.z + Math.sin(angle) * 2.4;
-                  const startY = getTerrainHeight(startX, startZ);
-                  group.position.set(startX - originX, startY, startZ - originZ);
-                  scene.add(group);
-                  const isLivestock =
-                    role === 'livestock_sheep' ||
-                    role === 'livestock_camel' ||
-                    role === 'wild_horse' ||
-                    role === 'tamed_stallion';
-                  const isHorse =
-                    role === 'wild_horse' || role === 'tamed_stallion';
-                  ambientCitizens.set(cid, {
-                    id: cid,
-                    homeStructureId: st.id,
-                    ownerId: st.ownerId,
-                    ownerColor: st.ownerColor,
-                    role,
-                    group,
-                    x: startX,
-                    z: startZ,
-                    lastGroundX: startX,
-                    lastGroundZ: startZ,
-                    lastGroundY: startY,
-                    targetX: startX,
-                    targetZ: startZ,
-                    rotationY: angle,
-                    speed: isHorse
-                      ? 4.6 + (i % 2) * 0.9
-                      : isLivestock
-                        ? 2.1 + (i % 2) * 0.45
-                        : 3.6 + (i % 3) * 0.55,
-                    waitTimer: (i * 0.7) % 2.2,
-                    goingHome: false,
-                    phaseOffset: i * 1.7 + st.x * 0.1,
-                  });
-                }
-              }
-            }
-
-            if (
-              st.kind === 'house' ||
-              st.kind === 'keep' ||
-              st.kind === 'farm' ||
-              st.kind === 'bedouin_tent'
-            ) {
-              expectedSmokeIds.add(st.id);
-              if (!hearthSmokeMeshes.has(st.id) && spawnedSmokeThisFrame < 4) {
-                spawnedSmokeThisFrame += 1;
-                const cachedSy = structureLods.get(st.id)?.userData.groundY;
-                const sy = typeof cachedSy === 'number' ? cachedSy : getTerrainHeight(st.x, st.z);
-                const roofH =
-                  st.kind === 'keep'
-                    ? 5.8 + (st.level ?? 1) * 1.1
-                    : st.kind === 'house'
-                      ? 2.8 + (st.level ?? 1) * 0.7
-                      : st.kind === 'bedouin_tent'
-                        ? 1.9
-                        : 2.3;
-                const puffs: THREE.Mesh[] = [];
-                for (let p = 0; p < 2; p++) {
-                  const puff = new THREE.Mesh(smokePuffGeom, smokePuffMat);
-                  puff.position.set(st.x + 0.6 - originX, sy + roofH + p * 1.1, st.z - 0.4 - originZ);
-                  scene.add(puff);
-                  puffs.push(puff);
-                }
-                hearthSmokeMeshes.set(st.id, {
-                  puffs,
-                  baseX: st.x + 0.6,
-                  baseY: sy + roofH,
-                  baseZ: st.z - 0.4,
-                });
-              }
-            }
-          }
-        }
-
-        for (const [cid, agent] of ambientCitizens.entries()) {
-          if (!expectedCitizenIds.has(cid)) {
-            scene.remove(agent.group);
-            ambientCitizens.delete(cid);
-          }
-        }
-
-        for (const [sid, smoke] of hearthSmokeMeshes.entries()) {
-          if (!expectedSmokeIds.has(sid)) {
-            smoke.puffs.forEach((p) => scene.remove(p));
-            hearthSmokeMeshes.delete(sid);
-          } else {
-            for (let idx = 0; idx < smoke.puffs.length; idx++) {
-              const puff = smoke.puffs[idx];
-              const cycle = (elapsedTime * 0.55 + idx * 0.5 + smoke.baseX * 0.05) % 1;
-              puff.position.y = smoke.baseY + cycle * 2.8;
-              puff.position.x =
-                smoke.baseX - originX + Math.sin(elapsedTime * 1.8 + idx) * 0.35 * cycle;
-              puff.position.z = smoke.baseZ - originZ;
-              const s = 0.55 + cycle * 0.9;
-              puff.scale.setScalar(s);
-            }
-          }
-        }
-
-        for (const agent of ambientCitizens.values()) {
-          const homeSt = strMap[agent.homeStructureId];
-          if (!homeSt) continue;
-
-          const dx = agent.targetX - agent.x;
-          const dz = agent.targetZ - agent.z;
-          const dist = Math.hypot(dx, dz);
-
-          if (dist > 0.25) {
-            const step = Math.min(dist, agent.speed * delta);
-            agent.x += (dx / dist) * step;
-            agent.z += (dz / dist) * step;
-            agent.rotationY = Math.atan2(dx, dz);
-          } else {
-            agent.waitTimer -= delta;
-            if (agent.waitTimer <= 0) {
-              const isLivestock =
-                agent.role === 'livestock_sheep' || agent.role === 'livestock_camel';
-              if (isLivestock) {
-                const grazeAngle = Math.random() * Math.PI * 2;
-                const grazeRadius = 1.6 + Math.random() * 2.4;
-                agent.targetX = homeSt.x + Math.cos(grazeAngle) * grazeRadius;
-                agent.targetZ = homeSt.z + Math.sin(grazeAngle) * grazeRadius;
-                agent.waitTimer = 2.4 + Math.random() * 2.8;
-              } else if (agent.goingHome) {
-                const a = Math.random() * Math.PI * 2;
-                agent.targetX = homeSt.x + Math.cos(a) * 2.3;
-                agent.targetZ = homeSt.z + Math.sin(a) * 2.3;
-                agent.goingHome = false;
-                agent.waitTimer = 1.6 + Math.random() * 1.8;
-              } else {
-                // Reservoir-sample matching nearby destination without allocating arrays
-                let pickedPreferred: (typeof homeSt) | null = null;
-                let prefCount = 0;
-                let pickedAny: (typeof homeSt) | null = null;
-                let anyCount = 0;
-                for (const stId in strMap) {
-                  const s = strMap[stId];
-                  if (s.ownerId !== agent.ownerId || s.id === agent.homeStructureId) continue;
-                  if (Math.hypot(s.x - homeSt.x, s.z - homeSt.z) > 48) continue;
-                  anyCount += 1;
-                  if (Math.random() * anyCount < 1) pickedAny = s;
-                  const isPref =
-                    agent.role === 'shepherd'
-                      ? s.kind === 'livestock_ranch' || s.kind === 'bedouin_tent' || s.kind === 'market'
-                      : agent.role === 'farmer'
-                        ? s.kind === 'farm' || s.kind === 'market'
-                        : agent.role === 'merchant'
-                          ? s.kind === 'market' || s.kind === 'keep'
-                          : agent.role === 'scholar'
-                            ? s.kind === 'temple' || s.kind === 'keep'
-                            : s.kind === 'farm' ||
-                              s.kind === 'livestock_ranch' ||
-                              s.kind === 'lumber_camp' ||
-                              s.kind === 'quarry' ||
-                              s.kind === 'house';
-                  if (isPref) {
-                    prefCount += 1;
-                    if (Math.random() * prefCount < 1) pickedPreferred = s;
-                  }
-                }
-                const dest = pickedPreferred ?? pickedAny;
-                if (dest) {
-                  const a = Math.random() * Math.PI * 2;
-                  const radius =
-                    dest.kind === 'farm' || dest.kind === 'livestock_ranch' ? 1.8 : 2.6;
-                  agent.targetX = dest.x + Math.cos(a) * radius;
-                  agent.targetZ = dest.z + Math.sin(a) * radius;
-                } else {
-                  const a = Math.random() * Math.PI * 2;
-                  agent.targetX = homeSt.x + Math.cos(a) * 5.0;
-                  agent.targetZ = homeSt.z + Math.sin(a) * 5.0;
-                }
-                agent.goingHome = true;
-                agent.waitTimer = 2.0 + Math.random() * 2.2;
-              }
-            }
-          }
-
-          const isAgentVisible =
-            agent.ownerId === pid || visionSystem.isWorldPointVisible(agent.x, agent.z, 0.22);
-          agent.group.visible = isAgentVisible;
-          if (!isAgentVisible) continue;
-
-          if (
-            Math.abs(agent.x - agent.lastGroundX) > 0.25 ||
-            Math.abs(agent.z - agent.lastGroundZ) > 0.25
-          ) {
-            agent.lastGroundX = agent.x;
-            agent.lastGroundZ = agent.z;
-            agent.lastGroundY = getTerrainHeight(agent.x, agent.z);
-          }
-          const isMoving = dist > 0.25;
-          const bobY = isMoving
-            ? Math.abs(Math.sin(elapsedTime * 9 + agent.phaseOffset)) * 0.12
-            : Math.abs(Math.sin(elapsedTime * 3.5 + agent.phaseOffset)) * 0.05;
-
-          agent.group.position.set(agent.x - originX, agent.lastGroundY + bobY, agent.z - originZ);
-          agent.group.rotation.y = rig.currentYaw;
-          agent.group.scale.setScalar(spritePixelPreservationScale);
-
-          const cData = agent.group.userData as {
-            mats?: { frame0: THREE.MeshBasicMaterial; frame1: THREE.MeshBasicMaterial };
-            spriteMesh?: THREE.Mesh;
-          };
-          if (cData.spriteMesh && cData.mats) {
-            const animSpeed = isMoving ? 6.5 : 2.6;
-            const frameIdx =
-              Math.floor(elapsedTime * animSpeed + agent.phaseOffset) % 2;
-            cData.spriteMesh.material =
-              frameIdx === 1 ? cData.mats.frame1 : cData.mats.frame0;
-
-            const relAngle = agent.rotationY - rig.currentYaw;
-            const facingSign = Math.sin(relAngle) < -0.15 ? -1 : 1;
-            cData.spriteMesh.scale.x = facingSign;
-          }
-        }
-
         // 4. Remote Players' Camera Frustums (Hidden outside friendly Among-Us Line-of-Sight)
         for (const [id, pres] of remotePlayerMeshes.entries()) {
           if (!plrMap[id] || id === pid) {
@@ -3324,6 +3130,7 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
         }
       }
 
+      visionSystem.bindToShaders(originX, originZ);
       renderer.render(scene, activeCamera);
 
       // Update Zero-Rerender 3D Compass, Location Readout & Horizon Landmark Signposts
@@ -3467,47 +3274,6 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
         if (pipEl) pipEl.style.opacity = '0';
       }
 
-      // Project up to HORIZON_SIGNPOST_POOL_SIZE signposts only when zoomed out (keep close-up view unobstructed)
-      let pinSlot = 0;
-      const viewW = cachedMountW;
-      const viewH = cachedMountH;
-      const showHorizonPins = rig.currentZoom > 72 && !buildModeRef.current;
-      for (
-        let i = 0;
-        showHorizonPins && i < lmCandidates.length && pinSlot < HORIZON_SIGNPOST_POOL_SIZE;
-        i++
-      ) {
-        const item = lmCandidates[i];
-        // Clamp far landmarks onto a virtual horizon ring so they stay inside the camera far plane
-        const dx = item.x - rig.currentX;
-        const dz = item.z - rig.currentZ;
-        const projScale = item.dist > 4800 ? 4800 / item.dist : 1;
-        const px = rig.currentX + dx * projScale - originX;
-        const pz = rig.currentZ + dz * projScale - originZ;
-        const baseY = getCachedLandmarkElevation(item.label, item.x, item.z);
-        const py = Math.max(12, baseY + (isPersp3D ? 36 : 16));
-        _projVec.set(px, py, pz).project(activeCamera);
-
-        if (_projVec.z < -1 || _projVec.z > 1) continue;
-        const sx = (_projVec.x * 0.5 + 0.5) * viewW;
-        const sy = (-_projVec.y * 0.5 + 0.5) * viewH;
-        if (sx < 64 || sx > viewW - 64 || sy < 92 || sy > viewH - 138) continue;
-
-        const btn = horizonPinElRefs.current[pinSlot];
-        if (btn) {
-          btn.style.display = 'flex';
-          btn.style.transform = `translate3d(${Math.round(sx)}px, ${Math.round(sy)}px, 0) translate(-50%, -100%)`;
-          btn.dataset.kind = item.isKeep ? 'keep' : 'landmark';
-          btn.textContent = `${item.label} · ${formatDistanceAr(item.dist)}`;
-          horizonPinTargetsRef.current[pinSlot] = { x: item.x, z: item.z };
-        }
-        pinSlot += 1;
-      }
-      for (; pinSlot < HORIZON_SIGNPOST_POOL_SIZE; pinSlot++) {
-        const btn = horizonPinElRefs.current[pinSlot];
-        if (btn) btn.style.display = 'none';
-      }
-
       // Report GPU Render Optimization Telemetry every 600ms
       frameCounter += 1;
       if (nowPerf - lastPerfReportTime >= 600) {
@@ -3567,18 +3333,59 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
       domElem.removeEventListener('pointercancel', onPointerUp);
       domElem.removeEventListener('wheel', onWheel);
       domElem.removeEventListener('contextmenu', onContextMenu);
+      domElem.removeEventListener('webglcontextlost', onWebglContextLost);
+      domElem.removeEventListener('webglcontextrestored', onWebglContextRestored);
       window.removeEventListener('resize', handleResize);
       resizeObserver?.disconnect();
       visionSystem.dispose();
+      terrainBundle.dispose();
       buildGridOverlay.dispose();
+      scene.environment?.dispose();
+      for (const [, entry] of unitMeshes.entries()) {
+        scene.remove(entry.group);
+        scene.remove(entry.targetLine);
+        (entry.selectionRing.material as THREE.Material).dispose();
+        const hpBar = entry.group.userData?.hpBar as { fillMat?: THREE.Material } | undefined;
+        hpBar?.fillMat?.dispose();
+        entry.targetLine.geometry.dispose();
+        (entry.targetLine.material as THREE.Material).dispose();
+      }
+      unitMeshes.clear();
+      for (const [, bar] of structHpBars.entries()) {
+        scene.remove(bar.group);
+        bar.fillMat.dispose();
+      }
+      structHpBars.clear();
       for (const [, pier] of wallJunctionPiers.entries()) {
         scene.remove(pier.group);
       }
       wallJunctionPiers.clear();
+      UNIT_SELECTION_RING_GEOM.dispose();
+      structSelectRingGeom.dispose();
+      structSelectRingMat.dispose();
+      ghostRingGeom.dispose();
+      ghostMat.dispose();
+      lineValidMat.dispose();
+      lineInvalidMat.dispose();
+      lineWaterMat.dispose();
       lineWallGeom.dispose();
       lineMoatGeom.dispose();
       lineTowerGeom.dispose();
       lineAnchorBeaconGeom.dispose();
+      lineAnchorBeaconMat.dispose();
+      moveMarkerGeom.dispose();
+      moveMarkerMat.dispose();
+      hpBgGeom.dispose();
+      hpBgMat.dispose();
+      fxArrowGeom.dispose();
+      fxSparkGeom.dispose();
+      fxBoulderGeom.dispose();
+      fxArrowMat.dispose();
+      fxFireArrowMat.dispose();
+      fxBoulderMat.dispose();
+      fxMeleeMat.dispose();
+      fxRepairMat.dispose();
+      fxBoomMat.dispose();
       fxAmbushMat.dispose();
       fxLootMat.dispose();
       renderer.dispose();
@@ -3603,24 +3410,22 @@ export const StrategicViewport: React.FC<StrategicViewportProps> = React.memo(({
     <div className="relative w-full h-full overflow-hidden touch-none">
       <div ref={canvasMountRef} className="w-full h-full cursor-crosshair touch-none" />
 
-      {/* 3D Horizon Landmark & Keep Signposts (Hidden during build placement & close-up view) */}
-      {!paused && !buildMode && (
-        <div className="pointer-events-none absolute inset-0 z-10 overflow-hidden">
-          {Array.from({ length: HORIZON_SIGNPOST_POOL_SIZE }).map((_, idx) => (
-            <button
-              key={idx}
-              type="button"
-              ref={(el) => {
-                horizonPinElRefs.current[idx] = el;
-              }}
-              onClick={() => {
-                const target = horizonPinTargetsRef.current[idx];
-                if (target) handleFlyToWorldPoint(target.x, target.z);
-              }}
-              style={{ display: 'none' }}
-              className="pointer-events-auto absolute top-0 left-0 px-1.5 py-0.5 bg-[#140e08]/78 hover:bg-[#24180c] border border-[#b68d43]/75 data-[kind=keep]:border-[#facc15] data-[kind=keep]:text-[#fef08a] text-[9.5px] font-bold text-[#f4e4c1] whitespace-nowrap cursor-pointer shadow"
-            />
-          ))}
+      {webglContextLost && (
+        <div
+          dir="rtl"
+          className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-[#0f0a05]/92 text-[#fde68a] p-6 text-center gap-3"
+        >
+          <div className="text-base font-bold">انقطع سياق الرسوميات (WebGL Context Lost)</div>
+          <p className="text-xs text-[#cbb68e] max-w-sm">
+            قد يكون المتصفح أو البطاقة الرسومية أعادت تشغيل الذاكرة. جاري الانتظار للاستعادة أو أعد تحميل الصفحة.
+          </p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="px-4 py-2 rts2k-bevel-btn-gold text-xs font-bold cursor-pointer"
+          >
+            إعادة تحميل المشهد
+          </button>
         </div>
       )}
 
